@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+translated=()
+while (($#)); do
+    case "$1" in
+        --target=x86_64-pc-windows-gnu)
+            translated+=("-target" "x86_64-windows-gnu")
+            shift
+            ;;
+        -target)
+            shift
+            if (($#)) && [[ "$1" == "x86_64-pc-windows-gnu" ]]; then
+                translated+=("-target" "x86_64-windows-gnu")
+                shift
+            else
+                translated+=("-target")
+                if (($#)); then
+                    translated+=("$1")
+                    shift
+                fi
+            fi
+            ;;
+        *)
+            translated+=("$1")
+            shift
+            ;;
+    esac
+done
+
+exec "$HOME/.local/bin/zig" cc -target x86_64-windows-gnu "${translated[@]}"

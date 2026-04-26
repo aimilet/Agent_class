@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+translated=()
+
+while (($#)); do
+    arg="$1"
+    shift
+
+    case "$arg" in
+        --)
+            continue
+            ;;
+        --target=x86_64-pc-windows-msvc)
+            translated+=("-target" "x86_64-windows-msvc")
+            ;;
+        -nologo|/nologo|-Brepro|/Brepro|/Gy|/Zc:wchar_t|/Zc:forScope|/Zc:inline)
+            ;;
+        -MD|/MD)
+            translated+=("-D_MT" "-D_DLL")
+            ;;
+        -MT|/MT)
+            translated+=("-D_MT")
+            ;;
+        -O1|/O1)
+            translated+=("-O1")
+            ;;
+        -O2|/O2)
+            translated+=("-O2")
+            ;;
+        -W3|/W3|-W4|/W4|/Wall)
+            translated+=("-Wall")
+            ;;
+        /wd*)
+            ;;
+        /imsvc)
+            if (($#)); then
+                translated+=("-isystem" "$1")
+                shift
+            fi
+            ;;
+        -I)
+            if (($#)); then
+                translated+=("-I" "$1")
+                shift
+            fi
+            ;;
+        /I*)
+            translated+=("-I${arg:2}")
+            ;;
+        -Fo*|/Fo*)
+            translated+=("-o" "${arg:3}")
+            ;;
+        -Fe*|/Fe*)
+            translated+=("-o" "${arg:3}")
+            ;;
+        /D*)
+            translated+=("-D${arg:2}")
+            ;;
+        /U*)
+            translated+=("-U${arg:2}")
+            ;;
+        /clang:*)
+            translated+=("${arg:7}")
+            ;;
+        *)
+            translated+=("$arg")
+            ;;
+    esac
+done
+
+exec "$HOME/.local/bin/zig" cc -target x86_64-windows-msvc "${translated[@]}"

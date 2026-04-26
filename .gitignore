@@ -1,0 +1,9 @@
+.pytest_cache/
+__pycache__/
+*.pyc
+
+/backend/.venv/
+/backend/runtime/
+/backend/.pytest_cache/
+
+/frontend/target/

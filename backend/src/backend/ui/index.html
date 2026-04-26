@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>助教 Agent 控制台</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">AUTOMATED TA CONSOLE</p>
+          <h1>自动化改作业助教 Agent</h1>
+          <p class="hero-copy">
+            导名单、批量改名、审阅作业三条主流程已经连通。当前界面直接跑在本地后端上，适合先联调规则和审阅链路。
+          </p>
+        </div>
+        <div class="hero-status">
+          <div class="metric-card">
+            <span>服务状态</span>
+            <strong id="healthStatus">检查中</strong>
+          </div>
+          <div class="metric-card">
+            <span>学生人数</span>
+            <strong id="studentCount">0</strong>
+          </div>
+          <div class="metric-card">
+            <span>审阅任务</span>
+            <strong id="jobCount">0</strong>
+          </div>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <section class="panel panel-wide">
+          <div class="panel-header">
+            <div>
+              <h2>全局状态</h2>
+              <p>这里显示后端运行信息和当前启用能力。</p>
+            </div>
+            <span class="badge" id="llmBadge">LLM 未启用</span>
+          </div>
+          <div class="status-grid">
+            <article>
+              <h3>存储目录</h3>
+              <p id="storageRoot">-</p>
+            </article>
+            <article>
+              <h3>数据库</h3>
+              <p id="databaseUrl">-</p>
+            </article>
+            <article>
+              <h3>命名模板变量</h3>
+              <p>`{assignment}` `{student_no}` `{name}` `{class_name}` `{original_stem}`</p>
+            </article>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>1. 名单导入</h2>
+              <p>支持 pdf / csv / xlsx / xls。</p>
+            </div>
+          </div>
+          <form id="importForm" class="stack">
+            <label>
+              <span>班级名（可选）</span>
+              <input type="text" name="class_name" placeholder="例如：高一（3）班" />
+            </label>
+            <label>
+              <span>名单文件</span>
+              <input type="file" name="file" accept=".pdf,.csv,.xlsx,.xls" required />
+            </label>
+            <button type="submit">导入名单</button>
+          </form>
+          <pre id="importResult" class="result-box">等待导入</pre>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>学生列表</h2>
+              <p>用于改名匹配与审阅关联。</p>
+            </div>
+          </div>
+          <div id="studentList" class="student-list"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>2. 命名规则</h2>
+              <p>先新建规则，再做预览或执行。</p>
+            </div>
+          </div>
+          <form id="ruleForm" class="stack">
+            <label>
+              <span>规则名称</span>
+              <input type="text" name="name" placeholder="例如：物理作业规则" required />
+            </label>
+            <label>
+              <span>文件名模板</span>
+              <input type="text" name="template" value="{assignment}_{student_no}_{name}" required />
+            </label>
+            <label>
+              <span>默认作业名</span>
+              <input type="text" name="assignment_label_default" placeholder="例如：第一次作业" />
+            </label>
+            <label>
+              <span>规则说明</span>
+              <textarea name="description" rows="3" placeholder="记录这条规则的用途"></textarea>
+            </label>
+            <button type="submit">保存规则</button>
+          </form>
+          <div id="ruleList" class="rule-list"></div>
+        </section>
+
+        <section class="panel panel-wide">
+          <div class="panel-header">
+            <div>
+              <h2>批量改名</h2>
+              <p>输入本机目录路径，先预览，再执行。</p>
+            </div>
+          </div>
+          <form id="renameForm" class="grid-form">
+            <label>
+              <span>选择规则</span>
+              <select id="ruleSelect" name="rule_id"></select>
+            </label>
+            <label>
+              <span>作业目录路径</span>
+              <input type="text" name="directory_path" placeholder="/path/to/submissions" required />
+            </label>
+            <label>
+              <span>作业标签</span>
+              <input type="text" name="assignment_label" placeholder="例如：第 1 次实验报告" />
+            </label>
+            <div class="button-row">
+              <button type="button" id="previewButton">预览改名</button>
+              <button type="button" id="applyButton" class="ghost">执行改名</button>
+            </div>
+          </form>
+          <div id="renameResult" class="table-shell"></div>
+        </section>
+
+        <section class="panel panel-wide">
+          <div class="panel-header">
+            <div>
+              <h2>3. 自动审阅</h2>
+              <p>提交路径支持单文件、多文件，或直接输入一个目录路径。</p>
+            </div>
+          </div>
+          <form id="reviewForm" class="stack">
+            <label>
+              <span>任务标题</span>
+              <input type="text" name="title" placeholder="例如：牛顿定律作业批改" required />
+            </label>
+            <label>
+              <span>题目</span>
+              <textarea name="question" rows="4" placeholder="请输入题目正文" required></textarea>
+            </label>
+            <label>
+              <span>参考答案（可留空，由答题 Agent 生成）</span>
+              <textarea name="reference_answer" rows="4" placeholder="如果留空，将启用答题 Agent / 启发式参考答案"></textarea>
+            </label>
+            <label>
+              <span>评分规则（可选）</span>
+              <textarea name="rubric" rows="3" placeholder="例如：满分 100，概念 40，推导 40，表达 20"></textarea>
+            </label>
+            <label>
+              <span>提交路径（每行一个文件或目录）</span>
+              <textarea name="submission_paths" rows="5" placeholder="/path/to/file1.pdf&#10;/path/to/homework-folder" required></textarea>
+            </label>
+            <button type="submit">创建并执行审阅</button>
+          </form>
+        </section>
+
+        <section class="panel panel-wide">
+          <div class="panel-header">
+            <div>
+              <h2>审阅任务</h2>
+              <p>显示最近创建的任务与评分结果。</p>
+            </div>
+          </div>
+          <div id="jobList" class="job-list"></div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/static/app.js" defer></script>
+  </body>
+  </html>
