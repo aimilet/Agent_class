@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from backend.core.errors import DomainError
 from backend.db.repositories import ApprovalRepository, AssignmentRepository, SubmissionRepository
-from backend.domain.models import NamingOperation, NamingPlan, NamingPolicy
+from backend.domain.models import NamingOperation, NamingPlan, NamingPolicy, Submission
 from backend.domain.state_machine import ensure_transition
 from backend.graphs.naming_plan_graph import NamingPlanGraph
 from backend.infra.file_ops import execute_rename
@@ -212,8 +213,9 @@ class NamingService:
                     "source_path": result.source_path,
                     "target_path": result.target_path,
                 }
+                self._sync_submission_asset_paths(operation.submission, result.source_path, result.target_path)
                 operation.submission.current_path = result.target_path
-                operation.submission.canonical_name = operation.target_path.split("/")[-1]
+                operation.submission.canonical_name = Path(result.target_path).name
                 operation.submission.status = "named"
                 renamed_count += 1
             else:
@@ -236,6 +238,27 @@ class NamingService:
         self.session.commit()
         return self.get_plan(plan.public_id)
 
+    def _sync_submission_asset_paths(self, submission: Submission, source_path: str, target_path: str) -> None:
+        source = Path(source_path)
+        target = Path(target_path)
+        for asset in submission.assets:
+            asset_path = Path(asset.real_path)
+            if asset_path == source:
+                asset.real_path = str(target)
+                if asset.logical_path == source.name:
+                    asset.logical_path = target.name
+                continue
+            try:
+                relative_path = asset_path.relative_to(source)
+            except ValueError:
+                continue
+            asset.real_path = str(target / relative_path)
+            try:
+                logical_relative_path = Path(asset.logical_path).relative_to(source.name)
+            except ValueError:
+                continue
+            asset.logical_path = (Path(target.name) / logical_relative_path).as_posix()
+
     def rollback_plan(self, *, plan_public_id: str, operator_id: str = "system"):
         plan = self.get_plan(plan_public_id)
         for operation in plan.operations:
@@ -247,6 +270,7 @@ class NamingService:
             result = execute_rename(target_path, source_path)
             if result.executed:
                 operation.status = "rolled_back"
+                self._sync_submission_asset_paths(operation.submission, target_path, source_path)
                 operation.submission.current_path = source_path
         plan.status = "rolled_back"
         self.audit_service.record(

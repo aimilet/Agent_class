@@ -1,96 +1,81 @@
 use std::collections::VecDeque;
-use std::fs;
 use std::io::{BufRead, BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
-use eframe::CreationContext;
 use eframe::egui::{
     self, Color32, CornerRadius, FontDefinitions, FontFamily, FontId, Margin, RichText, Stroke,
     TextEdit, Ui,
 };
+use eframe::CreationContext;
 use rfd::FileDialog;
 
 use crate::api::ApiClient;
 use crate::models::{
-    DashboardSnapshot, HealthResponse, ManualReviewUpdate, RenameAgentAnalyzeResponse,
-    RenameAgentApplyResponse, RenameAgentPreviewRequest, RenameAgentPreviewResponse,
-    RenameApplyResponse, RenamePreviewItem, RenamePreviewRequest, RenamePreviewResponse,
-    RenameRuleCreate, RenameRuleRead, ReviewJobCreate, ReviewJobRead, StudentImportResponse,
-    StudentRead, SubmissionLogRead, SubmissionRead,
+    AgentRunRead, ApprovalTaskRead, AssignmentCreate, AssignmentRead, AuditEventRead,
+    CourseCreate, CourseEnrollmentRead, CourseRead, DashboardSnapshot, HealthResponse,
+    ManualReviewUpdate, NamingPlanCreate, NamingPlanRead, NamingPolicyCreate, NamingPolicyRead,
+    ReviewPrepRead, ReviewQuestionItemPatch, ReviewQuestionItemRead, ReviewResultRead,
+    ReviewRunCreate, ReviewRunRead, RosterCandidateDecision, RosterCandidateRead,
+    RosterImportBatchRead, RosterImportConfirmRequest, SubmissionConfirmDecision,
+    SubmissionImportBatchCreate, SubmissionImportBatchRead, SubmissionImportConfirmRequest,
+    SubmissionRead, ToolCallLogRead,
 };
 
-const MAX_BACKEND_LOG_LINES: usize = 500;
+const MAX_BACKEND_LOG_LINES: usize = 600;
 const CJK_FONT_NAME: &str = "noto_sans_cjk_sc";
 
-const ROSTER_PARSE_MODES: [(&str, &str); 3] = [
-    ("auto", "自动"),
-    ("local_only", "仅本地规则"),
-    ("agent_layout", "Agent 布局识别"),
-];
-
-const REVIEW_PARSE_MODES: [(&str, &str); 3] = [
-    ("auto", "自动"),
-    ("local_ocr", "本地 OCR / 文本"),
-    ("agent_vision", "视觉评分 Agent"),
-];
-
-const EXECUTION_STATUS_FILTERS: [(&str, &str); 4] = [
-    ("all", "全部执行状态"),
-    ("pending", "待处理"),
-    ("completed", "已完成"),
-    ("failed", "失败"),
-];
-
-const REVIEW_STATUS_FILTERS: [(&str, &str); 4] = [
-    ("all", "全部复核状态"),
-    ("auto_reviewed", "自动评审"),
-    ("reviewed", "已人工复核"),
-    ("needs_followup", "需跟进"),
-];
-
-const MANUAL_REVIEW_STATUS_OPTIONS: [(&str, &str); 2] = [
-    ("reviewed", "已人工复核"),
-    ("needs_followup", "需跟进"),
-];
+const ROSTER_PARSE_MODES: [(&str, &str); 3] = [("auto", "自动"), ("local_only", "本地优先"), ("agent_vision", "多模态 Agent")];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WorkspacePage {
     Overview,
-    Setup,
-    Rename,
-    Review,
-    ReviewDesk,
+    Courses,
+    Assignments,
+    Naming,
+    ReviewPrep,
+    ReviewRun,
+    Audit,
+    Settings,
 }
 
 impl WorkspacePage {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 8] = [
         Self::Overview,
-        Self::Setup,
-        Self::Rename,
-        Self::Review,
-        Self::ReviewDesk,
+        Self::Courses,
+        Self::Assignments,
+        Self::Naming,
+        Self::ReviewPrep,
+        Self::ReviewRun,
+        Self::Audit,
+        Self::Settings,
     ];
 
     fn title(self) -> &'static str {
         match self {
             Self::Overview => "总览",
-            Self::Setup => "数据准备",
-            Self::Rename => "批量改名",
-            Self::Review => "自动审阅",
-            Self::ReviewDesk => "人工复核",
+            Self::Courses => "课程与名单",
+            Self::Assignments => "作业与提交",
+            Self::Naming => "命名与审批",
+            Self::ReviewPrep => "评审初始化",
+            Self::ReviewRun => "正式评审",
+            Self::Audit => "日志审计",
+            Self::Settings => "设置",
         }
     }
 
-    fn summary(self) -> &'static str {
+    fn subtitle(self) -> &'static str {
         match self {
-            Self::Overview => "先看当前系统状态、关键指标和最近产出。",
-            Self::Setup => "集中处理后端托管、名单导入和规则维护。",
-            Self::Rename => "把规则改名与 Agent 改名拆成独立工作区。",
-            Self::Review => "创建自动审阅任务，并管理任务导出。",
-            Self::ReviewDesk => "专注筛选、人工复核和单份日志查看。",
+            Self::Overview => "以课程为中心查看当前流程进度。",
+            Self::Courses => "创建课程，导入名单，并确认学生候选。",
+            Self::Assignments => "创建单次作业，导入作业目录，并确认匹配关系。",
+            Self::Naming => "生成命名计划，查看命令预览，审批后再执行。",
+            Self::ReviewPrep => "上传题目/答案/评分规范材料，生成结构化评审基线。",
+            Self::ReviewRun => "启动多 Agent 评审，查看结果并进行人工复核。",
+            Self::Audit => "查看 Agent 调用、工具调用和课程审计事件。",
+            Self::Settings => "后端地址、本地后端进程和运行日志独立管理。",
         }
     }
 }
@@ -98,32 +83,42 @@ impl WorkspacePage {
 pub struct AssistantApp {
     backend_url: String,
     health: Option<HealthResponse>,
-    students: Vec<StudentRead>,
-    rules: Vec<RenameRuleRead>,
-    jobs: Vec<ReviewJobRead>,
-    selected_rule_id: Option<i64>,
-    selected_job_id: Option<i64>,
-    selected_submission_id: Option<i64>,
-    submission_logs: Vec<SubmissionLogRead>,
-    rename_preview: Option<RenamePreviewResponse>,
-    rename_apply: Option<RenameApplyResponse>,
-    rename_agent_analysis: Option<RenameAgentAnalyzeResponse>,
-    rename_agent_preview: Option<RenameAgentPreviewResponse>,
-    rename_agent_apply: Option<RenameAgentApplyResponse>,
-    last_import: Option<StudentImportResponse>,
+    courses: Vec<CourseRead>,
+    enrollments: Vec<CourseEnrollmentRead>,
+    assignments: Vec<AssignmentRead>,
+    submissions: Vec<SubmissionRead>,
+    roster_batch: Option<RosterImportBatchRead>,
+    roster_candidates: Vec<RosterCandidateRead>,
+    submission_batch: Option<SubmissionImportBatchRead>,
+    naming_policies: Vec<NamingPolicyRead>,
+    naming_plan: Option<NamingPlanRead>,
+    active_approval: Option<ApprovalTaskRead>,
+    review_prep: Option<ReviewPrepRead>,
+    review_questions: Vec<ReviewQuestionItemRead>,
+    review_run: Option<ReviewRunRead>,
+    review_results: Vec<ReviewResultRead>,
+    agent_runs: Vec<AgentRunRead>,
+    tool_calls: Vec<ToolCallLogRead>,
+    audit_events: Vec<AuditEventRead>,
+    selected_course_id: Option<String>,
+    selected_assignment_id: Option<String>,
+    selected_policy_id: Option<String>,
+    selected_question_id: Option<String>,
+    selected_result_id: Option<String>,
+    selected_agent_run_id: Option<String>,
+    active_page: WorkspacePage,
     status: String,
     pending_tasks: usize,
     event_tx: Sender<WorkerEvent>,
     event_rx: Receiver<WorkerEvent>,
     backend_control: BackendControl,
-    import_form: ImportForm,
-    rule_form: RuleForm,
-    rename_form: RenameForm,
-    rename_agent_form: RenameAgentForm,
-    review_form: ReviewForm,
-    filter_form: SubmissionFilterForm,
-    manual_review_form: ManualReviewForm,
-    active_page: WorkspacePage,
+    course_form: CourseForm,
+    roster_form: RosterForm,
+    assignment_form: AssignmentForm,
+    submission_form: SubmissionForm,
+    naming_form: NamingForm,
+    review_prep_form: ReviewPrepForm,
+    review_run_form: ReviewRunForm,
 }
 
 struct BackendControl {
@@ -133,132 +128,131 @@ struct BackendControl {
     logs: VecDeque<String>,
 }
 
-struct ImportForm {
-    file_path: String,
-    class_name: String,
+struct CourseForm {
+    course_code: String,
+    course_name: String,
+    term: String,
+    class_label: String,
+    teacher_name: String,
+}
+
+struct RosterForm {
+    file_paths: Vec<String>,
     parse_mode: String,
 }
 
-struct RuleForm {
-    name: String,
-    template: String,
-    description: String,
-    assignment_label_default: String,
-    match_threshold: String,
-}
-
-#[derive(Default)]
-struct RenameForm {
-    directory_path: String,
-    assignment_label: String,
-}
-
-#[derive(Default)]
-struct RenameAgentForm {
-    directory_path: String,
-    assignment_label: String,
-    naming_rule: String,
-}
-
-struct ReviewForm {
+struct AssignmentForm {
+    seq_no: String,
     title: String,
-    question: String,
-    question_paths: Vec<String>,
-    reference_answer: String,
-    reference_answer_paths: Vec<String>,
+    description: String,
+    due_at: String,
+}
+
+#[derive(Default)]
+struct SubmissionForm {
+    root_path: String,
+}
+
+struct NamingForm {
+    template_text: String,
+    natural_language_rule: String,
+    approval_note: String,
+}
+
+#[derive(Default)]
+struct ReviewPrepForm {
+    material_paths: Vec<String>,
+    question_text: String,
+    answer_short: String,
+    answer_full: String,
     rubric: String,
-    document_parse_mode: String,
-    submission_paths: Vec<String>,
+    score_weight: String,
+    status: String,
 }
 
-struct SubmissionFilterForm {
-    keyword: String,
-    execution_status: String,
-    review_status: String,
-    only_unmatched: bool,
-}
-
-struct ManualReviewForm {
-    bound_submission_id: Option<i64>,
-    score_input: String,
-    review_summary: String,
-    teacher_comment: String,
-    review_status: String,
+struct ReviewRunForm {
+    parallelism: String,
+    manual_score: String,
+    manual_summary: String,
+    manual_decision: String,
+    publish_note: String,
 }
 
 enum WorkerEvent {
     TaskStarted(String),
     TaskFinished(String),
     SnapshotLoaded(DashboardSnapshot),
-    ImportCompleted(StudentImportResponse),
-    RenamePreviewLoaded(RenamePreviewResponse),
-    RenameApplied(RenameApplyResponse),
-    RenameAgentAnalyzed(RenameAgentAnalyzeResponse),
-    RenameAgentPreviewLoaded(RenameAgentPreviewResponse),
-    RenameAgentApplied(RenameAgentApplyResponse),
-    ReviewCreated(ReviewJobRead),
-    SubmissionLogsLoaded(i64, Vec<SubmissionLogRead>),
-    ManualReviewSaved(i64),
+    CourseCreated(CourseRead),
+    EnrollmentsLoaded(Vec<CourseEnrollmentRead>),
+    AssignmentsLoaded(Vec<AssignmentRead>),
+    RosterBatchLoaded(RosterImportBatchRead),
+    RosterCandidatesLoaded(Vec<RosterCandidateRead>),
+    SubmissionBatchLoaded(SubmissionImportBatchRead),
+    SubmissionsLoaded(Vec<SubmissionRead>),
+    NamingPoliciesLoaded(Vec<NamingPolicyRead>),
+    NamingPlanLoaded(NamingPlanRead),
+    ApprovalLoaded(ApprovalTaskRead),
+    ReviewPrepLoaded(ReviewPrepRead),
+    ReviewQuestionsLoaded(Vec<ReviewQuestionItemRead>),
+    ReviewRunLoaded(ReviewRunRead),
+    ReviewResultsLoaded(Vec<ReviewResultRead>),
+    AgentRunsLoaded(Vec<AgentRunRead>),
+    ToolCallsLoaded(Vec<ToolCallLogRead>),
+    AuditEventsLoaded(Vec<AuditEventRead>),
     BackendLogLine(String),
     Error(String),
 }
 
-impl Default for RuleForm {
+impl Default for CourseForm {
     fn default() -> Self {
         Self {
-            name: String::new(),
-            template: "{assignment}_{student_no}_{name}".to_owned(),
-            description: String::new(),
-            assignment_label_default: String::new(),
-            match_threshold: "76".to_owned(),
+            course_code: String::new(),
+            course_name: String::new(),
+            term: "2026 春季".to_owned(),
+            class_label: String::new(),
+            teacher_name: String::new(),
         }
     }
 }
 
-impl Default for ImportForm {
+impl Default for RosterForm {
     fn default() -> Self {
         Self {
-            file_path: String::new(),
-            class_name: String::new(),
+            file_paths: Vec::new(),
             parse_mode: "auto".to_owned(),
         }
     }
 }
 
-impl Default for ReviewForm {
+impl Default for AssignmentForm {
     fn default() -> Self {
         Self {
+            seq_no: "1".to_owned(),
             title: String::new(),
-            question: String::new(),
-            question_paths: Vec::new(),
-            reference_answer: String::new(),
-            reference_answer_paths: Vec::new(),
-            rubric: String::new(),
-            document_parse_mode: "auto".to_owned(),
-            submission_paths: Vec::new(),
+            description: String::new(),
+            due_at: String::new(),
         }
     }
 }
 
-impl Default for SubmissionFilterForm {
+impl Default for NamingForm {
     fn default() -> Self {
         Self {
-            keyword: String::new(),
-            execution_status: "all".to_owned(),
-            review_status: "all".to_owned(),
-            only_unmatched: false,
+            template_text: "{assignment}_{student_no}_{name}".to_owned(),
+            natural_language_rule: "按课程作业序号、学号、姓名统一命名，保留原扩展名。".to_owned(),
+            approval_note: String::new(),
         }
     }
 }
 
-impl Default for ManualReviewForm {
+impl Default for ReviewRunForm {
     fn default() -> Self {
         Self {
-            bound_submission_id: None,
-            score_input: "0".to_owned(),
-            review_summary: String::new(),
-            teacher_comment: String::new(),
-            review_status: "reviewed".to_owned(),
+            parallelism: "4".to_owned(),
+            manual_score: "0".to_owned(),
+            manual_summary: String::new(),
+            manual_decision: "manual_reviewed".to_owned(),
+            publish_note: String::new(),
         }
     }
 }
@@ -273,19 +267,30 @@ impl AssistantApp {
         let app = Self {
             backend_url: "http://127.0.0.1:18080".to_owned(),
             health: None,
-            students: Vec::new(),
-            rules: Vec::new(),
-            jobs: Vec::new(),
-            selected_rule_id: None,
-            selected_job_id: None,
-            selected_submission_id: None,
-            submission_logs: Vec::new(),
-            rename_preview: None,
-            rename_apply: None,
-            rename_agent_analysis: None,
-            rename_agent_preview: None,
-            rename_agent_apply: None,
-            last_import: None,
+            courses: Vec::new(),
+            enrollments: Vec::new(),
+            assignments: Vec::new(),
+            submissions: Vec::new(),
+            roster_batch: None,
+            roster_candidates: Vec::new(),
+            submission_batch: None,
+            naming_policies: Vec::new(),
+            naming_plan: None,
+            active_approval: None,
+            review_prep: None,
+            review_questions: Vec::new(),
+            review_run: None,
+            review_results: Vec::new(),
+            agent_runs: Vec::new(),
+            tool_calls: Vec::new(),
+            audit_events: Vec::new(),
+            selected_course_id: None,
+            selected_assignment_id: None,
+            selected_policy_id: None,
+            selected_question_id: None,
+            selected_result_id: None,
+            selected_agent_run_id: None,
+            active_page: WorkspacePage::Overview,
             status: "桌面端已启动，等待连接后端".to_owned(),
             pending_tasks: 0,
             event_tx,
@@ -296,193 +301,540 @@ impl AssistantApp {
                 state: "未托管后端".to_owned(),
                 logs: VecDeque::new(),
             },
-            import_form: ImportForm::default(),
-            rule_form: RuleForm::default(),
-            rename_form: RenameForm::default(),
-            rename_agent_form: RenameAgentForm::default(),
-            review_form: ReviewForm::default(),
-            filter_form: SubmissionFilterForm::default(),
-            manual_review_form: ManualReviewForm::default(),
-            active_page: WorkspacePage::Overview,
+            course_form: CourseForm::default(),
+            roster_form: RosterForm::default(),
+            assignment_form: AssignmentForm::default(),
+            submission_form: SubmissionForm::default(),
+            naming_form: NamingForm::default(),
+            review_prep_form: ReviewPrepForm::default(),
+            review_run_form: ReviewRunForm::default(),
         };
         app.spawn_refresh();
         app
     }
 
     fn spawn_refresh(&self) {
-        self.spawn_task("刷新数据", |api| {
-            let snapshot = api.fetch_snapshot()?;
-            Ok(vec![WorkerEvent::SnapshotLoaded(snapshot)])
-        });
+        self.spawn_task("刷新数据", |api| Ok(vec![WorkerEvent::SnapshotLoaded(api.fetch_snapshot()?)]));
     }
 
-    fn spawn_import(&self) {
-        let file_path = self.import_form.file_path.trim().to_owned();
-        let class_name = trimmed_option(&self.import_form.class_name);
-        let parse_mode = self.import_form.parse_mode.clone();
-        self.spawn_task("导入名单", move |api| {
-            let response = api.import_students(&file_path, class_name.as_deref(), &parse_mode)?;
-            let snapshot = api.fetch_snapshot()?;
-            Ok(vec![
-                WorkerEvent::ImportCompleted(response),
-                WorkerEvent::SnapshotLoaded(snapshot),
-            ])
-        });
-    }
-
-    fn spawn_create_rule(&self) {
-        let payload = RenameRuleCreate {
-            name: self.rule_form.name.trim().to_owned(),
-            template: self.rule_form.template.trim().to_owned(),
-            description: trimmed_option(&self.rule_form.description),
-            assignment_label_default: trimmed_option(&self.rule_form.assignment_label_default),
-            match_threshold: self.rule_form.match_threshold.trim().parse().unwrap_or(76.0),
-            enabled: true,
-        };
-        self.spawn_task("创建规则", move |api| {
-            api.create_rule(&payload)?;
-            let snapshot = api.fetch_snapshot()?;
-            Ok(vec![WorkerEvent::SnapshotLoaded(snapshot)])
-        });
-    }
-
-    fn spawn_preview_rename(&self) {
-        let Some(rule_id) = self.selected_rule_id else {
-            self.send_error("请先选择一条改名规则。");
-            return;
-        };
-        let payload = RenamePreviewRequest {
-            directory_path: self.rename_form.directory_path.trim().to_owned(),
-            assignment_label: trimmed_option(&self.rename_form.assignment_label),
-        };
-        self.spawn_task("预览改名", move |api| {
-            let response = api.preview_rename(rule_id, &payload)?;
-            Ok(vec![WorkerEvent::RenamePreviewLoaded(response)])
-        });
-    }
-
-    fn spawn_apply_rename(&self) {
-        let Some(rule_id) = self.selected_rule_id else {
-            self.send_error("请先选择一条改名规则。");
-            return;
-        };
-        let payload = RenamePreviewRequest {
-            directory_path: self.rename_form.directory_path.trim().to_owned(),
-            assignment_label: trimmed_option(&self.rename_form.assignment_label),
-        };
-        self.spawn_task("执行改名", move |api| {
-            let response = api.apply_rename(rule_id, &payload)?;
-            let snapshot = api.fetch_snapshot()?;
-            Ok(vec![
-                WorkerEvent::RenameApplied(response),
-                WorkerEvent::SnapshotLoaded(snapshot),
-            ])
-        });
-    }
-
-    fn spawn_analyze_rename_agent(&self) {
-        let directory_path = self.rename_agent_form.directory_path.trim().to_owned();
-        self.spawn_task("统计命名形式", move |api| {
-            let response = api.analyze_rename_agent(&directory_path)?;
-            Ok(vec![WorkerEvent::RenameAgentAnalyzed(response)])
-        });
-    }
-
-    fn spawn_preview_rename_agent(&self) {
-        let payload = RenameAgentPreviewRequest {
-            directory_path: self.rename_agent_form.directory_path.trim().to_owned(),
-            naming_rule: self.rename_agent_form.naming_rule.trim().to_owned(),
-            assignment_label: trimmed_option(&self.rename_agent_form.assignment_label),
-        };
-        self.spawn_task("生成 Agent 改名预览", move |api| {
-            let response = api.preview_rename_agent(&payload)?;
-            Ok(vec![WorkerEvent::RenameAgentPreviewLoaded(response)])
-        });
-    }
-
-    fn spawn_apply_rename_agent(&self) {
-        let script_path = self
-            .rename_agent_preview
-            .as_ref()
-            .map(|response| response.script_path.clone())
-            .or_else(|| {
-                self.rename_agent_apply
-                    .as_ref()
-                    .map(|response| response.script_path.clone())
-            });
-        let Some(script_path) = script_path else {
-            self.send_error("请先生成 Agent 改名预览脚本。");
-            return;
-        };
-
-        self.spawn_task("执行 Agent 改名", move |api| {
-            let response = api.apply_rename_agent(&script_path)?;
-            Ok(vec![WorkerEvent::RenameAgentApplied(response)])
-        });
-    }
-
-    fn spawn_create_review(&self) {
-        let payload = ReviewJobCreate {
-            title: self.review_form.title.trim().to_owned(),
-            question: trimmed_option(&self.review_form.question),
-            question_paths: self.review_form.question_paths.clone(),
-            reference_answer: trimmed_option(&self.review_form.reference_answer),
-            reference_answer_paths: self.review_form.reference_answer_paths.clone(),
-            rubric: trimmed_option(&self.review_form.rubric),
-            submission_paths: self.review_form.submission_paths.clone(),
-            document_parse_mode: self.review_form.document_parse_mode.clone(),
-            score_scale: 100,
-            run_immediately: true,
-        };
-        self.spawn_task("创建审阅任务", move |api| {
-            let job = api.create_review_job(&payload)?;
-            let snapshot = api.fetch_snapshot()?;
-            Ok(vec![
-                WorkerEvent::ReviewCreated(job),
-                WorkerEvent::SnapshotLoaded(snapshot),
-            ])
-        });
-    }
-
-    fn spawn_load_logs(&self, submission_id: i64) {
-        self.spawn_task("加载日志", move |api| {
-            let logs = api.get_submission_logs(submission_id)?;
-            Ok(vec![WorkerEvent::SubmissionLogsLoaded(submission_id, logs)])
-        });
-    }
-
-    fn spawn_save_manual_review(&self) {
-        let Some(submission_id) = self.selected_submission_id else {
-            self.send_error("请先选择一份作业再保存复核。");
-            return;
-        };
-
-        let score = self.manual_review_form.score_input.trim().parse::<f32>().unwrap_or(-1.0);
-        if !(0.0..=100.0).contains(&score) {
-            self.send_error("人工复核分数必须在 0 到 100 之间。");
+    fn spawn_create_course(&self) {
+        if self.course_form.course_code.trim().is_empty() || self.course_form.course_name.trim().is_empty() {
+            self.send_error("课程编号和课程名称不能为空。");
             return;
         }
-        if self.manual_review_form.review_summary.trim().is_empty() {
-            self.send_error("人工复核总结不能为空。");
+        let payload = CourseCreate {
+            course_code: self.course_form.course_code.trim().to_owned(),
+            course_name: self.course_form.course_name.trim().to_owned(),
+            term: self.course_form.term.trim().to_owned(),
+            class_label: self.course_form.class_label.trim().to_owned(),
+            teacher_name: trimmed_option(&self.course_form.teacher_name),
+        };
+        self.spawn_task("创建课程", move |api| {
+            let course = api.create_course(&payload)?;
+            let snapshot = api.fetch_snapshot()?;
+            Ok(vec![WorkerEvent::CourseCreated(course), WorkerEvent::SnapshotLoaded(snapshot)])
+        });
+    }
+
+    fn spawn_load_course_context(&self) {
+        let Some(course_id) = self.selected_course_id.clone() else {
+            return;
+        };
+        self.spawn_task("加载课程上下文", move |api| {
+            Ok(vec![
+                WorkerEvent::EnrollmentsLoaded(api.list_enrollments(&course_id)?),
+                WorkerEvent::AssignmentsLoaded(api.list_assignments(&course_id)?),
+                WorkerEvent::AuditEventsLoaded(api.list_course_audit_events(&course_id).unwrap_or_default()),
+            ])
+        });
+    }
+
+    fn spawn_create_roster_import(&self) {
+        let Some(course_id) = self.selected_course_id.clone() else {
+            self.send_error("请先选择课程。");
+            return;
+        };
+        if self.roster_form.file_paths.is_empty() {
+            self.send_error("请先选择名单文件。");
             return;
         }
+        let files = self.roster_form.file_paths.clone();
+        let parse_mode = self.roster_form.parse_mode.clone();
+        self.spawn_task("创建名单导入", move |api| {
+            let batch = api.create_roster_import(&course_id, &files, &parse_mode)?;
+            Ok(vec![WorkerEvent::RosterBatchLoaded(batch)])
+        });
+    }
 
+    fn spawn_run_roster_import(&self) {
+        let Some(batch_id) = self.roster_batch.as_ref().map(|batch| batch.public_id.clone()) else {
+            self.send_error("请先创建名单导入批次。");
+            return;
+        };
+        self.spawn_task("运行初始化 Agent", move |api| {
+            let batch = api.run_roster_import(&batch_id)?;
+            let candidates = api.list_roster_candidates(&batch_id)?;
+            Ok(vec![WorkerEvent::RosterBatchLoaded(batch), WorkerEvent::RosterCandidatesLoaded(candidates)])
+        });
+    }
+
+    fn spawn_confirm_roster_import(&self) {
+        let Some(batch_id) = self.roster_batch.as_ref().map(|batch| batch.public_id.clone()) else {
+            self.send_error("请先运行名单初始化 Agent。");
+            return;
+        };
+        if self.roster_candidates.is_empty() {
+            self.send_error("当前没有可确认的名单候选。");
+            return;
+        }
+        let payload = RosterImportConfirmRequest {
+            items: self
+                .roster_candidates
+                .iter()
+                .map(|candidate| RosterCandidateDecision {
+                    candidate_public_id: candidate.public_id.clone(),
+                    decision_status: "accepted".to_owned(),
+                    student_no: candidate.student_no.clone(),
+                    name: Some(candidate.name.clone()),
+                    decision_note: Some("桌面端批量接受".to_owned()),
+                })
+                .collect(),
+        };
+        self.spawn_task("确认名单候选", move |api| {
+            Ok(vec![WorkerEvent::RosterBatchLoaded(api.confirm_roster_import(&batch_id, &payload)?)])
+        });
+    }
+
+    fn spawn_apply_roster_import(&self) {
+        let Some(batch_id) = self.roster_batch.as_ref().map(|batch| batch.public_id.clone()) else {
+            self.send_error("请先确认名单候选。");
+            return;
+        };
+        self.spawn_task("应用课程名单", move |api| {
+            let batch = api.apply_roster_import(&batch_id)?;
+            let course_id = batch.course_public_id.clone();
+            Ok(vec![
+                WorkerEvent::RosterBatchLoaded(batch),
+                WorkerEvent::EnrollmentsLoaded(api.list_enrollments(&course_id)?),
+                WorkerEvent::SnapshotLoaded(api.fetch_snapshot()?),
+            ])
+        });
+    }
+
+    fn spawn_create_assignment(&self) {
+        let Some(course_id) = self.selected_course_id.clone() else {
+            self.send_error("请先选择课程。");
+            return;
+        };
+        let seq_no = match self.assignment_form.seq_no.trim().parse::<i64>() {
+            Ok(value) => value,
+            Err(_) => {
+                self.send_error("作业序号必须是整数。");
+                return;
+            }
+        };
+        if self.assignment_form.title.trim().is_empty() {
+            self.send_error("作业标题不能为空。");
+            return;
+        }
+        let payload = AssignmentCreate {
+            seq_no,
+            title: self.assignment_form.title.trim().to_owned(),
+            description: trimmed_option(&self.assignment_form.description),
+            due_at: trimmed_option(&self.assignment_form.due_at),
+        };
+        self.spawn_task("创建作业", move |api| {
+            let assignment = api.create_assignment(&course_id, &payload)?;
+            Ok(vec![
+                WorkerEvent::AssignmentsLoaded(api.list_assignments(&course_id)?),
+                WorkerEvent::SubmissionsLoaded(api.list_assignment_submissions(&assignment.public_id).unwrap_or_default()),
+            ])
+        });
+    }
+
+    fn spawn_load_assignment_context(&self) {
+        let Some(assignment_id) = self.selected_assignment_id.clone() else {
+            return;
+        };
+        let review_prep_id = self
+            .selected_assignment()
+            .and_then(|assignment| assignment.review_prep_public_id.clone());
+        self.spawn_task("加载作业上下文", move |api| {
+            let mut events = vec![
+                WorkerEvent::SubmissionsLoaded(api.list_assignment_submissions(&assignment_id)?),
+                WorkerEvent::NamingPoliciesLoaded(api.list_naming_policies(&assignment_id).unwrap_or_default()),
+            ];
+            if let Some(prep_id) = review_prep_id {
+                if let Ok(prep) = api.get_review_prep(&prep_id) {
+                    events.push(WorkerEvent::ReviewPrepLoaded(prep));
+                }
+                if let Ok(questions) = api.list_review_questions(&prep_id) {
+                    events.push(WorkerEvent::ReviewQuestionsLoaded(questions));
+                }
+            }
+            Ok(events)
+        });
+    }
+
+    fn spawn_create_submission_import(&self) {
+        let Some(assignment_id) = self.selected_assignment_id.clone() else {
+            self.send_error("请先选择作业。");
+            return;
+        };
+        if self.submission_form.root_path.trim().is_empty() {
+            self.send_error("请选择作业文件夹。");
+            return;
+        }
+        let payload = SubmissionImportBatchCreate {
+            root_path: self.submission_form.root_path.trim().to_owned(),
+        };
+        self.spawn_task("创建作业导入", move |api| {
+            let batch = api.create_submission_import(&assignment_id, &payload)?;
+            Ok(vec![WorkerEvent::SubmissionBatchLoaded(batch)])
+        });
+    }
+
+    fn spawn_run_submission_import(&self) {
+        let Some(batch_id) = self.submission_batch.as_ref().map(|batch| batch.public_id.clone()) else {
+            self.send_error("请先创建作业导入批次。");
+            return;
+        };
+        self.spawn_task("运行导入 Agent", move |api| {
+            let batch = api.run_submission_import(&batch_id)?;
+            let submissions = api.list_batch_submissions(&batch_id)?;
+            Ok(vec![WorkerEvent::SubmissionBatchLoaded(batch), WorkerEvent::SubmissionsLoaded(submissions)])
+        });
+    }
+
+    fn spawn_confirm_submission_import(&self) {
+        let Some(batch_id) = self.submission_batch.as_ref().map(|batch| batch.public_id.clone()) else {
+            self.send_error("请先运行作业导入 Agent。");
+            return;
+        };
+        if self.submissions.is_empty() {
+            self.send_error("当前没有可确认的提交记录。");
+            return;
+        }
+        let payload = SubmissionImportConfirmRequest {
+            items: self
+                .submissions
+                .iter()
+                .map(|submission| SubmissionConfirmDecision {
+                    submission_public_id: submission.public_id.clone(),
+                    enrollment_public_id: submission.enrollment_public_id.clone(),
+                    status: Some(if submission.enrollment_public_id.is_some() { "confirmed" } else { "unmatched" }.to_owned()),
+                    note: Some("桌面端按 Agent 匹配结果确认".to_owned()),
+                })
+                .collect(),
+        };
+        self.spawn_task("确认作业匹配", move |api| {
+            Ok(vec![WorkerEvent::SubmissionBatchLoaded(api.confirm_submission_import(&batch_id, &payload)?)])
+        });
+    }
+
+    fn spawn_apply_submission_import(&self) {
+        let Some(batch_id) = self.submission_batch.as_ref().map(|batch| batch.public_id.clone()) else {
+            self.send_error("请先确认作业匹配。");
+            return;
+        };
+        self.spawn_task("应用作业导入", move |api| {
+            let batch = api.apply_submission_import(&batch_id)?;
+            let submissions = api.list_assignment_submissions(&batch.assignment_public_id)?;
+            Ok(vec![WorkerEvent::SubmissionBatchLoaded(batch), WorkerEvent::SubmissionsLoaded(submissions)])
+        });
+    }
+
+    fn spawn_create_naming_policy(&self) {
+        let Some(assignment_id) = self.selected_assignment_id.clone() else {
+            self.send_error("请先选择作业。");
+            return;
+        };
+        let payload = NamingPolicyCreate {
+            template_text: trimmed_option(&self.naming_form.template_text),
+            natural_language_rule: trimmed_option(&self.naming_form.natural_language_rule),
+        };
+        self.spawn_task("创建命名策略", move |api| {
+            api.create_naming_policy(&assignment_id, &payload)?;
+            Ok(vec![WorkerEvent::NamingPoliciesLoaded(api.list_naming_policies(&assignment_id)?)])
+        });
+    }
+
+    fn spawn_create_naming_plan(&self) {
+        let Some(assignment_id) = self.selected_assignment_id.clone() else {
+            self.send_error("请先选择作业。");
+            return;
+        };
+        let payload = NamingPlanCreate {
+            policy_public_id: self.selected_policy_id.clone(),
+            template_text: trimmed_option(&self.naming_form.template_text),
+            natural_language_rule: trimmed_option(&self.naming_form.natural_language_rule),
+        };
+        self.spawn_task("生成命名计划", move |api| {
+            Ok(vec![WorkerEvent::NamingPlanLoaded(api.create_naming_plan(&assignment_id, &payload)?)])
+        });
+    }
+
+    fn spawn_submit_naming_approval(&self) {
+        let Some(plan_id) = self.naming_plan.as_ref().map(|plan| plan.public_id.clone()) else {
+            self.send_error("请先生成命名计划。");
+            return;
+        };
+        self.spawn_task("提交命名审批", move |api| {
+            let task = api.submit_naming_plan_approval(&plan_id)?;
+            let plan = api.get_naming_plan(&plan_id)?;
+            Ok(vec![WorkerEvent::ApprovalLoaded(task), WorkerEvent::NamingPlanLoaded(plan)])
+        });
+    }
+
+    fn spawn_approve_active_task(&self) {
+        let Some(task_id) = self.active_approval.as_ref().map(|task| task.public_id.clone()) else {
+            self.send_error("当前没有审批任务。");
+            return;
+        };
+        let note = trimmed_option(&self.naming_form.approval_note).or_else(|| trimmed_option(&self.review_run_form.publish_note));
+        self.spawn_task("批准审批任务", move |api| {
+            Ok(vec![WorkerEvent::ApprovalLoaded(api.approve_task(&task_id, note)?)])
+        });
+    }
+
+    fn spawn_reject_active_task(&self) {
+        let Some(task_id) = self.active_approval.as_ref().map(|task| task.public_id.clone()) else {
+            self.send_error("当前没有审批任务。");
+            return;
+        };
+        let note = trimmed_option(&self.naming_form.approval_note).or_else(|| trimmed_option(&self.review_run_form.publish_note));
+        self.spawn_task("拒绝审批任务", move |api| {
+            Ok(vec![WorkerEvent::ApprovalLoaded(api.reject_task(&task_id, note)?)])
+        });
+    }
+
+    fn spawn_execute_naming_plan(&self) {
+        let Some(plan_id) = self.naming_plan.as_ref().map(|plan| plan.public_id.clone()) else {
+            self.send_error("请先生成并审批命名计划。");
+            return;
+        };
+        self.spawn_task("执行命名计划", move |api| {
+            let plan = api.execute_naming_plan(&plan_id)?;
+            let submissions = api.list_assignment_submissions(&plan.assignment_public_id).unwrap_or_default();
+            Ok(vec![WorkerEvent::NamingPlanLoaded(plan), WorkerEvent::SubmissionsLoaded(submissions)])
+        });
+    }
+
+    fn spawn_rollback_naming_plan(&self) {
+        let Some(plan_id) = self.naming_plan.as_ref().map(|plan| plan.public_id.clone()) else {
+            self.send_error("当前没有可回滚的命名计划。");
+            return;
+        };
+        self.spawn_task("回滚命名计划", move |api| {
+            Ok(vec![WorkerEvent::NamingPlanLoaded(api.rollback_naming_plan(&plan_id)?)])
+        });
+    }
+
+    fn spawn_create_review_prep(&self) {
+        let Some(assignment_id) = self.selected_assignment_id.clone() else {
+            self.send_error("请先选择作业。");
+            return;
+        };
+        if self.review_prep_form.material_paths.is_empty() {
+            self.send_error("请先选择评审初始化材料。");
+            return;
+        }
+        let files = self.review_prep_form.material_paths.clone();
+        self.spawn_task("创建评审初始化", move |api| {
+            Ok(vec![WorkerEvent::ReviewPrepLoaded(api.create_review_prep(&assignment_id, &files)?)])
+        });
+    }
+
+    fn spawn_run_review_prep(&self) {
+        let Some(prep_id) = self.review_prep.as_ref().map(|prep| prep.public_id.clone()) else {
+            self.send_error("请先创建评审初始化版本。");
+            return;
+        };
+        self.spawn_task("运行评审初始化 Agent", move |api| {
+            let prep = api.run_review_prep(&prep_id)?;
+            let questions = api.list_review_questions(&prep_id)?;
+            Ok(vec![WorkerEvent::ReviewPrepLoaded(prep), WorkerEvent::ReviewQuestionsLoaded(questions)])
+        });
+    }
+
+    fn spawn_patch_review_question(&self) {
+        let Some(item_id) = self.selected_question_id.clone() else {
+            self.send_error("请先选择题目项。");
+            return;
+        };
+        let score_weight = match trimmed_option(&self.review_prep_form.score_weight) {
+            Some(value) => match value.parse::<f32>() {
+                Ok(parsed) => Some(parsed),
+                Err(_) => {
+                    self.send_error("分值权重必须是数字。");
+                    return;
+                }
+            },
+            None => None,
+        };
+        let payload = ReviewQuestionItemPatch {
+            question_full_text: trimmed_option(&self.review_prep_form.question_text),
+            reference_answer_short: trimmed_option(&self.review_prep_form.answer_short),
+            reference_answer_full: trimmed_option(&self.review_prep_form.answer_full),
+            rubric_text: trimmed_option(&self.review_prep_form.rubric),
+            score_weight,
+            status: trimmed_option(&self.review_prep_form.status),
+        };
+        let prep_id = self.review_prep.as_ref().map(|prep| prep.public_id.clone());
+        self.spawn_task("保存题目项", move |api| {
+            let item = api.patch_review_question(&item_id, &payload)?;
+            let mut events = Vec::new();
+            if let Some(prep_id) = prep_id {
+                events.push(WorkerEvent::ReviewQuestionsLoaded(api.list_review_questions(&prep_id)?));
+            }
+            events.push(WorkerEvent::ReviewQuestionsLoaded(vec![item]));
+            Ok(events)
+        });
+    }
+
+    fn spawn_confirm_review_prep(&self) {
+        let Some(prep_id) = self.review_prep.as_ref().map(|prep| prep.public_id.clone()) else {
+            self.send_error("请先运行评审初始化 Agent。");
+            return;
+        };
+        self.spawn_task("确认评审初始化", move |api| {
+            let prep = api.confirm_review_prep(&prep_id)?;
+            let snapshot = api.fetch_snapshot()?;
+            Ok(vec![WorkerEvent::ReviewPrepLoaded(prep), WorkerEvent::SnapshotLoaded(snapshot)])
+        });
+    }
+
+    fn spawn_create_review_run(&self) {
+        let Some(assignment_id) = self.selected_assignment_id.clone() else {
+            self.send_error("请先选择作业。");
+            return;
+        };
+        let parallelism = match trimmed_option(&self.review_run_form.parallelism) {
+            Some(value) => match value.parse::<i64>() {
+                Ok(parsed) => Some(parsed),
+                Err(_) => {
+                    self.send_error("并行数必须是整数。");
+                    return;
+                }
+            },
+            None => None,
+        };
+        let payload = ReviewRunCreate {
+            review_prep_public_id: self.review_prep.as_ref().map(|prep| prep.public_id.clone()),
+            parallelism,
+        };
+        self.spawn_task("创建评审运行", move |api| {
+            Ok(vec![WorkerEvent::ReviewRunLoaded(api.create_review_run(&assignment_id, &payload)?)])
+        });
+    }
+
+    fn spawn_start_review_run(&self) {
+        let Some(run_id) = self.review_run.as_ref().map(|run| run.public_id.clone()) else {
+            self.send_error("请先创建评审运行。");
+            return;
+        };
+        self.spawn_task("启动正式评审", move |api| {
+            let run = api.start_review_run(&run_id)?;
+            let results = api.list_review_results(&run_id)?;
+            Ok(vec![WorkerEvent::ReviewRunLoaded(run), WorkerEvent::ReviewResultsLoaded(results)])
+        });
+    }
+
+    fn spawn_refresh_review_results(&self) {
+        let Some(run_id) = self.review_run.as_ref().map(|run| run.public_id.clone()) else {
+            self.send_error("当前没有评审运行。");
+            return;
+        };
+        self.spawn_task("刷新评审结果", move |api| {
+            Ok(vec![
+                WorkerEvent::ReviewRunLoaded(api.get_review_run(&run_id)?),
+                WorkerEvent::ReviewResultsLoaded(api.list_review_results(&run_id)?),
+            ])
+        });
+    }
+
+    fn spawn_retry_review_run(&self) {
+        let Some(run_id) = self.review_run.as_ref().map(|run| run.public_id.clone()) else {
+            self.send_error("当前没有评审运行。");
+            return;
+        };
+        self.spawn_task("重试需人工处理项", move |api| {
+            let run = api.retry_review_run(&run_id)?;
+            let results = api.list_review_results(&run_id)?;
+            Ok(vec![WorkerEvent::ReviewRunLoaded(run), WorkerEvent::ReviewResultsLoaded(results)])
+        });
+    }
+
+    fn spawn_publish_review_run(&self) {
+        let Some(run_id) = self.review_run.as_ref().map(|run| run.public_id.clone()) else {
+            self.send_error("当前没有评审运行。");
+            return;
+        };
+        self.spawn_task("提交发布审批", move |api| {
+            Ok(vec![WorkerEvent::ApprovalLoaded(api.publish_review_run(&run_id)?)])
+        });
+    }
+
+    fn spawn_execute_active_approval(&self) {
+        let Some(task_id) = self.active_approval.as_ref().map(|task| task.public_id.clone()) else {
+            self.send_error("当前没有审批任务。");
+            return;
+        };
+        self.spawn_task("执行审批副作用", move |api| {
+            Ok(vec![WorkerEvent::ApprovalLoaded(api.execute_approval_task(&task_id)?)])
+        });
+    }
+
+    fn spawn_manual_review_result(&self) {
+        let Some(result_id) = self.selected_result_id.clone() else {
+            self.send_error("请先选择评审结果。");
+            return;
+        };
+        let score = match self.review_run_form.manual_score.trim().parse::<f32>() {
+            Ok(value) => value,
+            Err(_) => {
+                self.send_error("人工复核分数必须是数字。");
+                return;
+            }
+        };
+        if self.review_run_form.manual_summary.trim().is_empty() {
+            self.send_error("人工复核说明不能为空。");
+            return;
+        }
         let payload = ManualReviewUpdate {
-            score,
-            review_summary: self.manual_review_form.review_summary.trim().to_owned(),
-            teacher_comment: trimmed_option(&self.manual_review_form.teacher_comment),
-            review_status: self.manual_review_form.review_status.clone(),
+            total_score: score,
+            summary: self.review_run_form.manual_summary.trim().to_owned(),
+            decision: self.review_run_form.manual_decision.trim().to_owned(),
         };
-
+        let run_id = self.review_run.as_ref().map(|run| run.public_id.clone());
         self.spawn_task("保存人工复核", move |api| {
-            api.patch_submission_manual_review(submission_id, &payload)?;
-            let snapshot = api.fetch_snapshot()?;
-            let logs = api.get_submission_logs(submission_id)?;
-            Ok(vec![
-                WorkerEvent::ManualReviewSaved(submission_id),
-                WorkerEvent::SnapshotLoaded(snapshot),
-                WorkerEvent::SubmissionLogsLoaded(submission_id, logs),
-            ])
+            api.manual_review_result(&result_id, &payload)?;
+            let mut events = Vec::new();
+            if let Some(run_id) = run_id {
+                events.push(WorkerEvent::ReviewResultsLoaded(api.list_review_results(&run_id)?));
+            }
+            Ok(events)
+        });
+    }
+
+    fn spawn_load_audit(&self) {
+        let course_id = self.selected_course_id.clone();
+        self.spawn_task("加载审计日志", move |api| {
+            let mut events = vec![WorkerEvent::AgentRunsLoaded(api.list_agent_runs()?)];
+            if let Some(course_id) = course_id {
+                events.push(WorkerEvent::AuditEventsLoaded(api.list_course_audit_events(&course_id).unwrap_or_default()));
+            }
+            Ok(events)
+        });
+    }
+
+    fn spawn_load_tool_calls(&self) {
+        let Some(run_id) = self.selected_agent_run_id.clone() else {
+            self.send_error("请先选择 Agent 调用记录。");
+            return;
+        };
+        self.spawn_task("加载工具调用", move |api| {
+            Ok(vec![WorkerEvent::ToolCallsLoaded(api.list_tool_calls(&run_id)?)])
         });
     }
 
@@ -502,7 +854,6 @@ impl AssistantApp {
                     return;
                 }
             };
-
             match task(client) {
                 Ok(events) => {
                     for event in events {
@@ -513,9 +864,12 @@ impl AssistantApp {
                     sender.send(WorkerEvent::Error(err)).ok();
                 }
             }
-
             sender.send(WorkerEvent::TaskFinished(label.to_owned())).ok();
         });
+    }
+
+    fn send_error(&self, message: &str) {
+        self.event_tx.send(WorkerEvent::Error(message.to_owned())).ok();
     }
 
     fn start_backend_process(&mut self) {
@@ -523,17 +877,15 @@ impl AssistantApp {
             self.status = "后端已经在运行。".to_owned();
             return;
         }
-
         let backend_dir = PathBuf::from(self.backend_control.backend_dir.trim());
         if !backend_dir.is_dir() {
             self.status = format!("后端目录不存在：{}", backend_dir.display());
             return;
         }
-
-        let command = format!("cd {} && uv run backend", shell_quote(backend_dir.as_path()));
-        let mut child = match Command::new("bash")
-            .arg("-lc")
-            .arg(command)
+        let mut child = match Command::new("uv")
+            .arg("run")
+            .arg("backend")
+            .current_dir(&backend_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
@@ -545,14 +897,12 @@ impl AssistantApp {
                 return;
             }
         };
-
         if let Some(stdout) = child.stdout.take() {
             spawn_backend_reader(stdout, self.event_tx.clone(), "STDOUT");
         }
         if let Some(stderr) = child.stderr.take() {
             spawn_backend_reader(stderr, self.event_tx.clone(), "STDERR");
         }
-
         self.push_backend_log("已启动本地后端进程。");
         self.backend_control.state = "运行中（桌面端托管）".to_owned();
         self.backend_control.child = Some(child);
@@ -615,362 +965,182 @@ impl AssistantApp {
                     };
                 }
                 WorkerEvent::SnapshotLoaded(snapshot) => self.apply_snapshot(snapshot),
-                WorkerEvent::ImportCompleted(response) => self.last_import = Some(response),
-                WorkerEvent::RenamePreviewLoaded(response) => {
-                    self.rename_apply = None;
-                    self.rename_preview = Some(response);
-                }
-                WorkerEvent::RenameApplied(response) => {
-                    self.rename_preview = None;
-                    self.rename_apply = Some(response);
-                }
-                WorkerEvent::RenameAgentAnalyzed(response) => {
-                    self.rename_agent_preview = None;
-                    self.rename_agent_apply = None;
-                    self.rename_agent_analysis = Some(response);
-                }
-                WorkerEvent::RenameAgentPreviewLoaded(response) => {
-                    self.rename_agent_apply = None;
-                    self.rename_agent_analysis = Some(RenameAgentAnalyzeResponse {
-                        directory_path: response.directory_path.clone(),
-                        detected_patterns: response.detected_patterns.clone(),
-                        notes: response.notes.clone(),
-                    });
-                    self.rename_agent_preview = Some(response);
-                }
-                WorkerEvent::RenameAgentApplied(response) => {
-                    self.rename_agent_apply = Some(response);
-                }
-                WorkerEvent::ReviewCreated(job) => {
-                    self.selected_job_id = Some(job.id);
-                    self.selected_submission_id = None;
-                    self.submission_logs.clear();
-                    self.status = format!("审阅任务已创建：{}", job.title);
-                }
-                WorkerEvent::SubmissionLogsLoaded(submission_id, logs) => {
-                    self.selected_submission_id = Some(submission_id);
-                    self.submission_logs = logs;
-                    self.status = format!("已加载提交 #{submission_id} 的日志");
-                }
-                WorkerEvent::ManualReviewSaved(submission_id) => {
-                    self.status = format!("已保存提交 #{submission_id} 的人工复核结果");
-                }
+                WorkerEvent::CourseCreated(course) => self.selected_course_id = Some(course.public_id),
+                WorkerEvent::EnrollmentsLoaded(items) => self.enrollments = items,
+                WorkerEvent::AssignmentsLoaded(items) => self.apply_assignments(items),
+                WorkerEvent::RosterBatchLoaded(batch) => self.roster_batch = Some(batch),
+                WorkerEvent::RosterCandidatesLoaded(items) => self.roster_candidates = items,
+                WorkerEvent::SubmissionBatchLoaded(batch) => self.submission_batch = Some(batch),
+                WorkerEvent::SubmissionsLoaded(items) => self.submissions = items,
+                WorkerEvent::NamingPoliciesLoaded(items) => self.apply_policies(items),
+                WorkerEvent::NamingPlanLoaded(plan) => self.naming_plan = Some(plan),
+                WorkerEvent::ApprovalLoaded(task) => self.active_approval = Some(task),
+                WorkerEvent::ReviewPrepLoaded(prep) => self.review_prep = Some(prep),
+                WorkerEvent::ReviewQuestionsLoaded(items) => self.apply_review_questions(items),
+                WorkerEvent::ReviewRunLoaded(run) => self.review_run = Some(run),
+                WorkerEvent::ReviewResultsLoaded(items) => self.apply_review_results(items),
+                WorkerEvent::AgentRunsLoaded(items) => self.apply_agent_runs(items),
+                WorkerEvent::ToolCallsLoaded(items) => self.tool_calls = items,
+                WorkerEvent::AuditEventsLoaded(items) => self.audit_events = items,
                 WorkerEvent::BackendLogLine(line) => self.push_backend_log(&line),
-                WorkerEvent::Error(err) => {
-                    self.status = err;
-                }
+                WorkerEvent::Error(err) => self.status = err,
             }
         }
     }
 
     fn apply_snapshot(&mut self, snapshot: DashboardSnapshot) {
-        self.health = Some(snapshot.health);
-        self.students = snapshot.students;
-        self.rules = snapshot.rules;
-        self.jobs = snapshot.jobs;
-
-        if self.selected_rule_id.is_none() {
-            self.selected_rule_id = self.rules.first().map(|rule| rule.id);
+        self.health = snapshot.health;
+        self.courses = snapshot.courses;
+        if self.selected_course_id.is_none() || self.selected_course().is_none() {
+            self.selected_course_id = self.courses.first().map(|course| course.public_id.clone());
         }
-
-        if self.selected_job_id.is_none() {
-            self.selected_job_id = self.jobs.first().map(|job| job.id);
-        } else if self.selected_job().is_none() {
-            self.selected_job_id = self.jobs.first().map(|job| job.id);
-            self.selected_submission_id = None;
-            self.submission_logs.clear();
-        }
-
-        if let Some(submission) = self.selected_submission().cloned() {
-            self.sync_manual_review_form(&submission);
-        } else {
-            self.selected_submission_id = None;
-            self.submission_logs.clear();
-            self.manual_review_form = ManualReviewForm::default();
+        if self.selected_course_id.is_some() && self.assignments.is_empty() {
+            self.spawn_load_course_context();
         }
     }
 
-    fn selected_job(&self) -> Option<&ReviewJobRead> {
-        self.jobs
+    fn apply_assignments(&mut self, assignments: Vec<AssignmentRead>) {
+        self.assignments = assignments;
+        if self.selected_assignment_id.is_none() || self.selected_assignment().is_none() {
+            self.selected_assignment_id = self.assignments.first().map(|assignment| assignment.public_id.clone());
+        }
+    }
+
+    fn apply_policies(&mut self, policies: Vec<NamingPolicyRead>) {
+        self.naming_policies = policies;
+        if self.selected_policy_id.is_none() || !self.naming_policies.iter().any(|policy| Some(&policy.public_id) == self.selected_policy_id.as_ref()) {
+            self.selected_policy_id = self.naming_policies.first().map(|policy| policy.public_id.clone());
+        }
+    }
+
+    fn apply_review_questions(&mut self, items: Vec<ReviewQuestionItemRead>) {
+        if items.len() == 1 && !self.review_questions.is_empty() {
+            let item = items.into_iter().next().unwrap();
+            if let Some(existing) = self.review_questions.iter_mut().find(|existing| existing.public_id == item.public_id) {
+                *existing = item;
+            }
+            return;
+        }
+        self.review_questions = items;
+        if self.selected_question_id.is_none() || self.selected_question().is_none() {
+            self.selected_question_id = self.review_questions.first().map(|item| item.public_id.clone());
+            self.sync_question_form();
+        }
+    }
+
+    fn apply_review_results(&mut self, items: Vec<ReviewResultRead>) {
+        self.review_results = items;
+        if self.selected_result_id.is_none() || self.selected_result().is_none() {
+            self.selected_result_id = self.review_results.first().map(|item| item.public_id.clone());
+            self.sync_result_form();
+        }
+    }
+
+    fn apply_agent_runs(&mut self, items: Vec<AgentRunRead>) {
+        self.agent_runs = items;
+        if self.selected_agent_run_id.is_none() || self.selected_agent_run().is_none() {
+            self.selected_agent_run_id = self.agent_runs.first().map(|run| run.public_id.clone());
+        }
+    }
+
+    fn selected_course(&self) -> Option<&CourseRead> {
+        self.courses.iter().find(|course| Some(&course.public_id) == self.selected_course_id.as_ref())
+    }
+
+    fn selected_assignment(&self) -> Option<&AssignmentRead> {
+        self.assignments
             .iter()
-            .find(|job| Some(job.id) == self.selected_job_id)
-            .or_else(|| self.jobs.first())
+            .find(|assignment| Some(&assignment.public_id) == self.selected_assignment_id.as_ref())
     }
 
-    fn selected_submission(&self) -> Option<&SubmissionRead> {
-        self.selected_job().and_then(|job| {
-            job.submissions
-                .iter()
-                .find(|submission| Some(submission.id) == self.selected_submission_id)
-        })
-    }
-
-    fn sync_manual_review_form(&mut self, submission: &SubmissionRead) {
-        if self.manual_review_form.bound_submission_id == Some(submission.id) {
-            return;
-        }
-        self.manual_review_form.bound_submission_id = Some(submission.id);
-        self.manual_review_form.score_input = submission
-            .score
-            .map(|value| format!("{value:.2}"))
-            .unwrap_or_else(|| "0".to_owned());
-        self.manual_review_form.review_summary = submission.review_summary.clone().unwrap_or_default();
-        self.manual_review_form.teacher_comment = submission.teacher_comment.clone().unwrap_or_default();
-        self.manual_review_form.review_status = match submission.review_status.as_str() {
-            "needs_followup" => "needs_followup".to_owned(),
-            _ => "reviewed".to_owned(),
-        };
-    }
-
-    fn select_submission(&mut self, submission: SubmissionRead) {
-        self.selected_submission_id = Some(submission.id);
-        self.sync_manual_review_form(&submission);
-        self.spawn_load_logs(submission.id);
-    }
-
-    fn filtered_submissions(&self, job: &ReviewJobRead) -> Vec<SubmissionRead> {
-        let keyword = self.filter_form.keyword.trim().to_lowercase();
-        job.submissions
+    fn selected_question(&self) -> Option<&ReviewQuestionItemRead> {
+        self.review_questions
             .iter()
-            .filter(|submission| {
-                if self.filter_form.execution_status != "all"
-                    && submission.status != self.filter_form.execution_status
-                {
-                    return false;
-                }
-                if self.filter_form.review_status != "all"
-                    && submission.review_status != self.filter_form.review_status
-                {
-                    return false;
-                }
-                if self.filter_form.only_unmatched && submission.student_id.is_some() {
-                    return false;
-                }
-                if keyword.is_empty() {
-                    return true;
-                }
-                let haystack = format!(
-                    "{} {} {} {}",
-                    submission.original_filename,
-                    submission
-                        .matched_student_name
-                        .as_deref()
-                        .unwrap_or_default(),
-                    submission
-                        .review_summary
-                        .as_deref()
-                        .unwrap_or_default(),
-                    submission
-                        .student_match_method
-                        .as_deref()
-                        .unwrap_or_default()
-                )
-                .to_lowercase();
-                haystack.contains(&keyword)
-            })
-            .cloned()
-            .collect()
+            .find(|item| Some(&item.public_id) == self.selected_question_id.as_ref())
     }
 
-    fn export_selected_job_json(&mut self) {
-        let Some(job) = self.selected_job() else {
-            self.status = "请先选择一个任务再导出。".to_owned();
-            return;
-        };
-        let default_name = sanitize_filename(&format!("{}_report.json", job.title));
-        if let Some(path) = FileDialog::new().set_file_name(&default_name).save_file() {
-            match serde_json::to_string_pretty(job) {
-                Ok(content) => match fs::write(&path, content) {
-                    Ok(_) => self.status = format!("已导出 JSON：{}", path.display()),
-                    Err(err) => self.status = format!("导出 JSON 失败：{err}"),
-                },
-                Err(err) => self.status = format!("序列化 JSON 失败：{err}"),
-            }
+    fn selected_result(&self) -> Option<&ReviewResultRead> {
+        self.review_results
+            .iter()
+            .find(|item| Some(&item.public_id) == self.selected_result_id.as_ref())
+    }
+
+    fn selected_agent_run(&self) -> Option<&AgentRunRead> {
+        self.agent_runs
+            .iter()
+            .find(|run| Some(&run.public_id) == self.selected_agent_run_id.as_ref())
+    }
+
+    fn sync_question_form(&mut self) {
+        if let Some(item) = self.selected_question().cloned() {
+            self.review_prep_form.question_text = item.question_full_text;
+            self.review_prep_form.answer_short = item.reference_answer_short.unwrap_or_default();
+            self.review_prep_form.answer_full = item.reference_answer_full.unwrap_or_default();
+            self.review_prep_form.rubric = item.rubric_text.unwrap_or_default();
+            self.review_prep_form.score_weight = format!("{}", item.score_weight);
+            self.review_prep_form.status = item.status;
         }
     }
 
-    fn export_selected_job_markdown(&mut self) {
-        let Some(job) = self.selected_job() else {
-            self.status = "请先选择一个任务再导出。".to_owned();
-            return;
-        };
-        let default_name = sanitize_filename(&format!("{}_report.md", job.title));
-        if let Some(path) = FileDialog::new().set_file_name(&default_name).save_file() {
-            let content = build_markdown_report(job, self.selected_submission(), &self.submission_logs);
-            match fs::write(&path, content) {
-                Ok(_) => self.status = format!("已导出 Markdown：{}", path.display()),
-                Err(err) => self.status = format!("导出 Markdown 失败：{err}"),
-            }
+    fn sync_result_form(&mut self) {
+        if let Some(result) = self.selected_result().cloned() {
+            self.review_run_form.manual_score = result
+                .total_score
+                .map(|score| format!("{score:.2}"))
+                .unwrap_or_else(|| "0".to_owned());
+            self.review_run_form.manual_summary = result.summary.unwrap_or_default();
+            self.review_run_form.manual_decision = result.decision.unwrap_or_else(|| "manual_reviewed".to_owned());
         }
     }
 
-    fn send_error(&self, message: &str) {
-        self.event_tx
-            .send(WorkerEvent::Error(message.to_owned()))
-            .ok();
-    }
-
-    fn pick_backend_directory(&mut self) {
-        if let Some(path) = FileDialog::new().pick_folder() {
-            self.backend_control.backend_dir = path.display().to_string();
-        }
-    }
-
-    fn pick_import_file(&mut self) {
-        if let Some(path) = FileDialog::new()
-            .add_filter("名单文件", &["csv", "xlsx", "xls", "pdf"])
-            .pick_file()
-        {
-            self.import_form.file_path = path.display().to_string();
-        }
-    }
-
-    fn pick_rename_directory(&mut self) {
-        if let Some(path) = FileDialog::new().pick_folder() {
-            self.rename_form.directory_path = path.display().to_string();
-        }
-    }
-
-    fn pick_rename_agent_directory(&mut self) {
-        if let Some(path) = FileDialog::new().pick_folder() {
-            self.rename_agent_form.directory_path = path.display().to_string();
-        }
-    }
-
-    fn add_review_files(&mut self) {
-        if let Some(paths) = FileDialog::new()
-            .add_filter(
-                "作业文件",
-                &[
-                    "txt", "md", "pdf", "docx", "ppt", "pptx", "pptm", "potx", "potm", "png",
-                    "jpg", "jpeg", "bmp", "webp", "tif", "tiff", "zip", "tar", "tgz", "tbz",
-                    "tbz2", "txz",
-                ],
-            )
-            .pick_files()
-        {
+    fn choose_roster_files(&mut self) {
+        if let Some(paths) = FileDialog::new().pick_files() {
             for path in paths {
-                self.push_review_path(path.display().to_string());
+                push_unique_path(&mut self.roster_form.file_paths, path.display().to_string());
             }
         }
     }
 
-    fn add_review_folder(&mut self) {
+    fn choose_submission_folder(&mut self) {
         if let Some(path) = FileDialog::new().pick_folder() {
-            self.push_review_path(path.display().to_string());
+            self.submission_form.root_path = path.display().to_string();
         }
     }
 
-    fn add_question_files(&mut self) {
-        if let Some(paths) = FileDialog::new()
-            .add_filter(
-                "题目文件",
-                &[
-                    "txt", "md", "pdf", "docx", "ppt", "pptx", "pptm", "potx", "potm", "png",
-                    "jpg", "jpeg", "bmp", "webp", "tif", "tiff",
-                ],
-            )
-            .pick_files()
-        {
+    fn choose_review_materials(&mut self) {
+        if let Some(paths) = FileDialog::new().pick_files() {
             for path in paths {
-                Self::push_unique_path(&mut self.review_form.question_paths, path.display().to_string());
+                push_unique_path(&mut self.review_prep_form.material_paths, path.display().to_string());
             }
-        }
-    }
-
-    fn add_question_folder(&mut self) {
-        if let Some(path) = FileDialog::new().pick_folder() {
-            Self::push_unique_path(
-                &mut self.review_form.question_paths,
-                path.display().to_string(),
-            );
-        }
-    }
-
-    fn add_reference_answer_files(&mut self) {
-        if let Some(paths) = FileDialog::new()
-            .add_filter(
-                "答案文件",
-                &[
-                    "txt", "md", "pdf", "docx", "ppt", "pptx", "pptm", "potx", "potm", "png",
-                    "jpg", "jpeg", "bmp", "webp", "tif", "tiff",
-                ],
-            )
-            .pick_files()
-        {
-            for path in paths {
-                Self::push_unique_path(
-                    &mut self.review_form.reference_answer_paths,
-                    path.display().to_string(),
-                );
-            }
-        }
-    }
-
-    fn add_reference_answer_folder(&mut self) {
-        if let Some(path) = FileDialog::new().pick_folder() {
-            Self::push_unique_path(
-                &mut self.review_form.reference_answer_paths,
-                path.display().to_string(),
-            );
-        }
-    }
-
-    fn push_review_path(&mut self, path: String) {
-        Self::push_unique_path(&mut self.review_form.submission_paths, path);
-    }
-
-    fn push_unique_path(paths: &mut Vec<String>, path: String) {
-        if !paths.contains(&path) {
-            paths.push(path);
         }
     }
 
     fn toolbar(&mut self, ui: &mut Ui) {
-        let selected_job_title = self.selected_job().map(|job| job.title.clone());
         let task_text = if self.pending_tasks > 0 {
             format!("处理中 {}", self.pending_tasks)
         } else {
-            "当前空闲".to_owned()
+            "空闲".to_owned()
         };
+        let course_name = self
+            .selected_course()
+            .map(|course| course.course_name.clone())
+            .unwrap_or_else(|| "未选择课程".to_owned());
+        let assignment_name = self
+            .selected_assignment()
+            .map(|assignment| format!("第 {} 次 · {}", assignment.seq_no, assignment.title))
+            .unwrap_or_else(|| "未选择作业".to_owned());
 
         ui.horizontal_wrapped(|ui| {
             ui.vertical(|ui| {
-                ui.label(RichText::new("助教 Agent").size(26.0).strong());
-                ui.label(RichText::new(self.active_page.summary()).color(subtle_text_color()));
+                ui.label(RichText::new("助教 Agent").size(25.0).strong().color(text_primary_color()));
+                ui.label(RichText::new(self.active_page.subtitle()).color(subtle_text_color()));
             });
-            ui.add_space(18.0);
-            status_chip(
-                ui,
-                "后端",
-                &self.backend_control.state,
-                if self.backend_control.child.is_some() {
-                    success_color()
-                } else {
-                    muted_chip_color()
-                },
-            );
-            status_chip(
-                ui,
-                "任务",
-                &task_text,
-                if self.pending_tasks > 0 {
-                    warning_color()
-                } else {
-                    success_color()
-                },
-            );
-            if let Some(title) = selected_job_title {
-                status_chip(ui, "当前任务", &title, accent_color());
-            }
-            ui.add_space(8.0);
-            ui.label(RichText::new("后端地址").small().color(subtle_text_color()));
-            ui.add(
-                TextEdit::singleline(&mut self.backend_url)
-                    .desired_width(240.0)
-                    .hint_text("http://127.0.0.1:18080"),
-            );
-            if ui.button("刷新数据").clicked() {
+            ui.add_space(12.0);
+            status_chip(ui, "后端", &self.backend_control.state, if self.backend_control.child.is_some() { success_color() } else { muted_chip_color() });
+            status_chip(ui, "任务", &task_text, if self.pending_tasks > 0 { warning_color() } else { success_color() });
+            status_chip(ui, "课程", &course_name, accent_color());
+            status_chip(ui, "作业", &assignment_name, muted_chip_color());
+            if ui.button("刷新").clicked() {
                 self.spawn_refresh();
             }
             ui.label(RichText::new(&self.status).color(text_primary_color()).strong());
@@ -979,29 +1149,26 @@ impl AssistantApp {
 
     fn navigation_panel(&mut self, ui: &mut Ui) {
         ui.vertical(|ui| {
-            ui.label(RichText::new("工作区").small().color(subtle_text_color()));
-            ui.add_space(6.0);
+            ui.label(RichText::new("工作台").small().color(subtle_text_color()));
+            ui.add_space(8.0);
             for page in WorkspacePage::ALL {
                 if navigation_button(ui, page, self.active_page == page).clicked() {
                     self.active_page = page;
                 }
                 ui.add_space(4.0);
             }
-
             ui.add_space(10.0);
-            section_card(ui, "当前状态", "保持关键状态始终可见。", |ui| {
-                ui.label(format!("后端：{}", self.backend_control.state));
-                ui.label(format!(
-                    "学生 {} · 规则 {} · 任务 {}",
-                    self.students.len(),
-                    self.rules.len(),
-                    self.jobs.len()
-                ));
-                if let Some(health) = &self.health {
-                    ui.label(format!("存储目录：{}", health.storage_root));
+            section_card(ui, "当前上下文", "", |ui| {
+                if let Some(course) = self.selected_course() {
+                    ui.label(RichText::new(&course.course_name).strong());
+                    ui.label(format!("{} · {}", course.course_code, course.term));
+                    ui.label(format!("状态：{}", course.status));
                 } else {
-                    ui.label("还没有连接到本地 API。");
+                    ui.label("还没有选择课程。");
                 }
+                ui.separator();
+                ui.label(format!("学生 {} · 作业 {}", self.enrollments.len(), self.assignments.len()));
+                ui.label(format!("提交 {} · 评审结果 {}", self.submissions.len(), self.review_results.len()));
             });
         });
     }
@@ -1014,842 +1181,508 @@ impl AssistantApp {
                 ui.add_space(12.0);
                 match self.active_page {
                     WorkspacePage::Overview => self.render_overview_page(ui),
-                    WorkspacePage::Setup => self.render_setup_page(ui),
-                    WorkspacePage::Rename => self.render_rename_page(ui),
-                    WorkspacePage::Review => self.render_review_page(ui),
-                    WorkspacePage::ReviewDesk => self.render_review_desk_page(ui),
+                    WorkspacePage::Courses => self.render_courses_page(ui),
+                    WorkspacePage::Assignments => self.render_assignments_page(ui),
+                    WorkspacePage::Naming => self.render_naming_page(ui),
+                    WorkspacePage::ReviewPrep => self.render_review_prep_page(ui),
+                    WorkspacePage::ReviewRun => self.render_review_run_page(ui),
+                    WorkspacePage::Audit => self.render_audit_page(ui),
+                    WorkspacePage::Settings => self.render_settings_page(ui),
                 }
             });
     }
 
     fn render_page_header(&mut self, ui: &mut Ui) {
-        let page = self.active_page;
-        section_card(ui, page.title(), page.summary(), |ui| {
+        section_card(ui, self.active_page.title(), self.active_page.subtitle(), |ui| {
             ui.horizontal_wrapped(|ui| {
-                metric_card(
-                    ui,
-                    "服务",
-                    self.health
-                        .as_ref()
-                        .map(|health| health.app_name.as_str())
-                        .unwrap_or("未连接"),
-                    self.health
-                        .as_ref()
-                        .map(|health| if health.llm_enabled { "LLM 已启用" } else { "LLM 未启用" })
-                        .unwrap_or("等待连接"),
-                );
-                metric_card(ui, "学生", &self.students.len().to_string(), "已导入名单");
-                metric_card(ui, "规则", &self.rules.len().to_string(), "命名规则");
-                metric_card(ui, "任务", &self.jobs.len().to_string(), "审阅任务");
+                metric_card(ui, "服务", self.health.as_ref().map(|item| item.app_name.as_str()).unwrap_or("未连接"), self.health.as_ref().map(|item| if item.llm_enabled { "LLM 已启用" } else { "LLM 未启用" }).unwrap_or("等待连接"));
+                metric_card(ui, "课程", &self.courses.len().to_string(), "独立课程空间");
+                metric_card(ui, "学生", &self.enrollments.len().to_string(), "当前课程名单");
+                metric_card(ui, "作业", &self.assignments.len().to_string(), "当前课程作业");
+                metric_card(ui, "Agent", &self.agent_runs.len().to_string(), "可追溯调用");
             });
         });
     }
 
     fn render_overview_page(&mut self, ui: &mut Ui) {
-        self.render_runtime_panel(ui);
+        section_card(ui, "流程看板", "从课程初始化到发布评审结果的整体进度。", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                lifecycle_card(ui, "1", "课程名单", self.roster_batch.as_ref().map(|item| item.status.as_str()).unwrap_or("未开始"), "初始化 Agent 识别学生名单");
+                lifecycle_card(ui, "2", "作业导入", self.submission_batch.as_ref().map(|item| item.status.as_str()).unwrap_or("未开始"), "导入 Agent 匹配学生作业");
+                lifecycle_card(ui, "3", "命名规范", self.naming_plan.as_ref().map(|item| item.status.as_str()).unwrap_or("未开始"), "生成计划后审批执行");
+                lifecycle_card(ui, "4", "评审基线", self.review_prep.as_ref().map(|item| item.status.as_str()).unwrap_or("未开始"), "题目、答案与评分规范");
+                lifecycle_card(ui, "5", "正式评审", self.review_run.as_ref().map(|item| item.status.as_str()).unwrap_or("未开始"), "多 Agent 并行评分");
+            });
+        });
         ui.add_space(12.0);
-        self.render_recent_jobs_summary(ui);
-        ui.add_space(12.0);
-        self.render_recent_rename(ui);
-        if self.rename_agent_analysis.is_some()
-            || self.rename_agent_preview.is_some()
-            || self.rename_agent_apply.is_some()
-        {
+        section_card(ui, "最近对象", "当前课程与作业的关键对象。", |ui| {
+            two_columns(ui, |left, right| {
+                let ui = left;
+                self.render_course_selector(ui);
+                if ui.button("加载课程上下文").clicked() {
+                    self.spawn_load_course_context();
+                }
+                let ui = right;
+                self.render_assignment_selector(ui);
+                if ui.button("加载作业上下文").clicked() {
+                    self.spawn_load_assignment_context();
+                }
+            });
+        });
+    }
+
+    fn render_courses_page(&mut self, ui: &mut Ui) {
+        two_columns(ui, |left, right| {
+            let ui = left;
+            section_card(ui, "创建课程", "每门课程都有独立名单、作业和评审链路。", |ui| {
+                labeled_text(ui, "课程编号", &mut self.course_form.course_code, "CS101");
+                labeled_text(ui, "课程名称", &mut self.course_form.course_name, "程序设计基础");
+                labeled_text(ui, "学期", &mut self.course_form.term, "2026 春季");
+                labeled_text(ui, "班级标签", &mut self.course_form.class_label, "1 班 / A 班");
+                labeled_text(ui, "授课教师", &mut self.course_form.teacher_name, "可选");
+                if ui.button("创建课程").clicked() {
+                    self.spawn_create_course();
+                }
+            });
             ui.add_space(12.0);
-            self.render_rename_agent_result(ui);
-        }
-    }
-
-    fn render_setup_page(&mut self, ui: &mut Ui) {
-        self.render_backend_manager(ui);
-        ui.add_space(12.0);
-        self.render_import_panel(ui);
-        ui.add_space(12.0);
-        self.render_rule_editor(ui);
-    }
-
-    fn render_rename_page(&mut self, ui: &mut Ui) {
-        self.render_rule_rename_panel(ui);
-        ui.add_space(12.0);
-        self.render_agent_rename_panel(ui);
-        ui.add_space(12.0);
-        self.render_recent_rename(ui);
-        ui.add_space(12.0);
-        self.render_rename_agent_result(ui);
-    }
-
-    fn render_review_page(&mut self, ui: &mut Ui) {
-        self.render_review_builder(ui);
-        ui.add_space(12.0);
-        self.render_job_selector(ui);
-    }
-
-    fn render_review_desk_page(&mut self, ui: &mut Ui) {
-        self.render_selected_job(ui);
-        ui.add_space(12.0);
-        self.render_manual_review_panel(ui);
-        ui.add_space(12.0);
-        self.render_selected_logs(ui);
-    }
-
-    fn render_backend_manager(&mut self, ui: &mut Ui) {
-        section_card(ui, "本地后端", "托管后端进程与工作目录。", |ui| {
-            ui.label("后端目录");
-            ui.horizontal_wrapped(|ui| {
-                ui.add(
-                    TextEdit::singleline(&mut self.backend_control.backend_dir)
-                        .desired_width(360.0),
-                );
-                if ui.button("选择目录").clicked() {
-                    self.pick_backend_directory();
+            section_card(ui, "课程列表", "选择后加载对应的学生与作业。", |ui| {
+                self.render_course_selector(ui);
+                if ui.button("加载选中课程").clicked() {
+                    self.spawn_load_course_context();
                 }
-            });
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("启动后端").clicked() {
-                    self.start_backend_process();
-                }
-                if ui.button("停止后端").clicked() {
-                    self.stop_backend_process();
-                }
-                if ui.button("重启后端").clicked() {
-                    self.restart_backend_process();
-                }
-            });
-            ui.label(format!("当前状态：{}", self.backend_control.state));
-        });
-    }
-
-    fn render_import_panel(&mut self, ui: &mut Ui) {
-        section_card(ui, "名单导入", "导入学生名单并选择解析模式。", |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label("名单文件");
-                if ui.button("选择名单文件").clicked() {
-                    self.pick_import_file();
-                }
-            });
-            ui.add(
-                TextEdit::singleline(&mut self.import_form.file_path)
-                    .hint_text("选择 csv / xlsx / xls / pdf")
-                    .desired_width(f32::INFINITY),
-            );
-            ui.label("班级名（可选）");
-            ui.add(
-                TextEdit::singleline(&mut self.import_form.class_name).desired_width(f32::INFINITY),
-            );
-            combo_box(
-                ui,
-                "roster-parse-mode",
-                "解析模式",
-                &mut self.import_form.parse_mode,
-                &ROSTER_PARSE_MODES,
-            );
-            let can_submit = !self.import_form.file_path.trim().is_empty();
-            if ui
-                .add_enabled(can_submit, egui::Button::new("导入名单"))
-                .clicked()
-            {
-                self.spawn_import();
-            }
-            if let Some(result) = &self.last_import {
-                ui.separator();
-                ui.label(format!(
-                    "成功导入 {} 人，跳过 {} 人，模式：{}",
-                    result.imported_count, result.skipped_count, result.parse_mode_used
-                ));
-                for note in &result.notes {
-                    ui.label(format!("说明：{note}"));
-                }
-            }
-        });
-    }
-
-    fn render_rule_editor(&mut self, ui: &mut Ui) {
-        section_card(ui, "改名规则", "维护批量改名时使用的模板与阈值。", |ui| {
-            ui.label("规则名称");
-            ui.add(TextEdit::singleline(&mut self.rule_form.name).desired_width(f32::INFINITY));
-            ui.label("文件名模板");
-            ui.add(TextEdit::singleline(&mut self.rule_form.template).desired_width(f32::INFINITY));
-            ui.label("默认作业名");
-            ui.add(
-                TextEdit::singleline(&mut self.rule_form.assignment_label_default)
-                    .desired_width(f32::INFINITY),
-            );
-            ui.label("说明");
-            ui.add(
-                TextEdit::multiline(&mut self.rule_form.description)
-                    .desired_rows(2)
-                    .desired_width(f32::INFINITY),
-            );
-            ui.label("匹配阈值");
-            ui.add(
-                TextEdit::singleline(&mut self.rule_form.match_threshold).desired_width(120.0),
-            );
-            let can_submit =
-                !self.rule_form.name.trim().is_empty() && !self.rule_form.template.trim().is_empty();
-            if ui
-                .add_enabled(can_submit, egui::Button::new("保存规则"))
-                .clicked()
-            {
-                self.spawn_create_rule();
-            }
-        });
-    }
-
-    fn render_rule_rename_panel(&mut self, ui: &mut Ui) {
-        section_card(ui, "规则改名", "用现有规则批量预览或执行重命名。", |ui| {
-            combo_box_rule(ui, &self.rules, &mut self.selected_rule_id);
-            ui.horizontal_wrapped(|ui| {
-                ui.label("作业目录");
-                if ui.button("选择文件夹").clicked() {
-                    self.pick_rename_directory();
-                }
-            });
-            ui.add(
-                TextEdit::singleline(&mut self.rename_form.directory_path)
-                    .hint_text("选择学生作业目录")
-                    .desired_width(f32::INFINITY),
-            );
-            ui.label("作业标签");
-            ui.add(
-                TextEdit::singleline(&mut self.rename_form.assignment_label)
-                    .desired_width(f32::INFINITY),
-            );
-            let can_submit =
-                self.selected_rule_id.is_some() && !self.rename_form.directory_path.trim().is_empty();
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add_enabled(can_submit, egui::Button::new("预览改名"))
-                    .clicked()
-                {
-                    self.spawn_preview_rename();
-                }
-                if ui
-                    .add_enabled(can_submit, egui::Button::new("执行改名"))
-                    .clicked()
-                {
-                    self.spawn_apply_rename();
-                }
-            });
-        });
-    }
-
-    fn render_agent_rename_panel(&mut self, ui: &mut Ui) {
-        section_card(ui, "Agent 改名", "先识别命名风格，再生成临时脚本。", |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label("作业目录");
-                if ui.button("选择文件夹").clicked() {
-                    self.pick_rename_agent_directory();
-                }
-            });
-            ui.add(
-                TextEdit::singleline(&mut self.rename_agent_form.directory_path)
-                    .hint_text("选择需要 Agent 处理的作业目录")
-                    .desired_width(f32::INFINITY),
-            );
-            ui.label("规范命名要求");
-            ui.add(
-                TextEdit::multiline(&mut self.rename_agent_form.naming_rule)
-                    .desired_rows(3)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("例如：命名改为 作业名_学号_姓名"),
-            );
-            ui.label("作业标签（可选）");
-            ui.add(
-                TextEdit::singleline(&mut self.rename_agent_form.assignment_label)
-                    .desired_width(f32::INFINITY),
-            );
-            let can_analyze = !self.rename_agent_form.directory_path.trim().is_empty();
-            let can_preview = can_analyze && !self.rename_agent_form.naming_rule.trim().is_empty();
-            let can_apply_agent = self
-                .rename_agent_preview
-                .as_ref()
-                .map(|response| !response.script_path.trim().is_empty())
-                .unwrap_or(false)
-                || self
-                    .rename_agent_apply
-                    .as_ref()
-                    .map(|response| !response.script_path.trim().is_empty())
-                    .unwrap_or(false);
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add_enabled(can_analyze, egui::Button::new("统计命名形式"))
-                    .clicked()
-                {
-                    self.spawn_analyze_rename_agent();
-                }
-                if ui
-                    .add_enabled(can_preview, egui::Button::new("生成预览脚本"))
-                    .clicked()
-                {
-                    self.spawn_preview_rename_agent();
-                }
-                if ui
-                    .add_enabled(can_apply_agent, egui::Button::new("执行生成脚本"))
-                    .clicked()
-                {
-                    self.spawn_apply_rename_agent();
-                }
-            });
-            if let Some(preview) = &self.rename_agent_preview {
-                ui.label(format!("当前脚本：{}", preview.script_path));
-            }
-        });
-    }
-
-    fn render_review_builder(&mut self, ui: &mut Ui) {
-        section_card(ui, "创建自动审阅任务", "把题目、参考答案和待审阅作业集中整理。", |ui| {
-            ui.label("任务标题");
-            ui.add(TextEdit::singleline(&mut self.review_form.title).desired_width(f32::INFINITY));
-            ui.label("题目文本（可留空，如果下面已添加题目文件）");
-            ui.add(
-                TextEdit::multiline(&mut self.review_form.question)
-                    .desired_rows(4)
-                    .desired_width(f32::INFINITY),
-            );
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("添加题目文件").clicked() {
-                    self.add_question_files();
-                }
-                if ui.button("添加题目文件夹").clicked() {
-                    self.add_question_folder();
-                }
-                if ui.button("清空题目文件").clicked() {
-                    self.review_form.question_paths.clear();
-                }
-            });
-            if self.review_form.question_paths.is_empty() {
-                ui.label("当前没有题目文件路径。");
-            } else {
-                let mut remove_index: Option<usize> = None;
-                for (index, path) in self.review_form.question_paths.iter().enumerate() {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(format!("题目 {}.", index + 1));
-                        ui.label(path);
-                        if ui.small_button("移除").clicked() {
-                            remove_index = Some(index);
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    for course in self.courses.clone() {
+                        let selected = Some(&course.public_id) == self.selected_course_id.as_ref();
+                        if selectable_card(ui, selected, &course.course_name, &format!("{} · {} · {}", course.course_code, course.term, course.status)).clicked() {
+                            self.selected_course_id = Some(course.public_id);
+                            self.spawn_load_course_context();
                         }
-                    });
-                }
-                if let Some(index) = remove_index {
-                    self.review_form.question_paths.remove(index);
-                }
-            }
-
-            ui.separator();
-            ui.label("参考答案文本（可留空，也可只添加答案文件）");
-            ui.add(
-                TextEdit::multiline(&mut self.review_form.reference_answer)
-                    .desired_rows(4)
-                    .desired_width(f32::INFINITY),
-            );
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("添加答案文件").clicked() {
-                    self.add_reference_answer_files();
-                }
-                if ui.button("添加答案文件夹").clicked() {
-                    self.add_reference_answer_folder();
-                }
-                if ui.button("清空答案文件").clicked() {
-                    self.review_form.reference_answer_paths.clear();
-                }
-            });
-            if self.review_form.reference_answer_paths.is_empty() {
-                ui.label("当前没有答案文件路径。");
-            } else {
-                let mut remove_index: Option<usize> = None;
-                for (index, path) in self.review_form.reference_answer_paths.iter().enumerate() {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(format!("答案 {}.", index + 1));
-                        ui.label(path);
-                        if ui.small_button("移除").clicked() {
-                            remove_index = Some(index);
-                        }
-                    });
-                }
-                if let Some(index) = remove_index {
-                    self.review_form.reference_answer_paths.remove(index);
-                }
-            }
-
-            ui.separator();
-            ui.label("评分规则（可选）");
-            ui.add(
-                TextEdit::multiline(&mut self.review_form.rubric)
-                    .desired_rows(3)
-                    .desired_width(f32::INFINITY),
-            );
-            combo_box(
-                ui,
-                "review-parse-mode",
-                "图像处理 / 审阅模式",
-                &mut self.review_form.document_parse_mode,
-                &REVIEW_PARSE_MODES,
-            );
-
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("添加作业文件").clicked() {
-                    self.add_review_files();
-                }
-                if ui.button("添加作业文件夹").clicked() {
-                    self.add_review_folder();
-                }
-                if ui.button("清空列表").clicked() {
-                    self.review_form.submission_paths.clear();
-                }
-            });
-
-            if self.review_form.submission_paths.is_empty() {
-                ui.label("当前还没有待审阅路径。");
-            } else {
-                let mut remove_index: Option<usize> = None;
-                for (index, path) in self.review_form.submission_paths.iter().enumerate() {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(format!("{}.", index + 1));
-                        ui.label(path);
-                        if ui.small_button("移除").clicked() {
-                            remove_index = Some(index);
-                        }
-                    });
-                }
-                if let Some(index) = remove_index {
-                    self.review_form.submission_paths.remove(index);
-                }
-            }
-
-            ui.label("评分制式：100 分");
-            let has_question_source =
-                !self.review_form.question.trim().is_empty() || !self.review_form.question_paths.is_empty();
-            let can_submit = !self.review_form.title.trim().is_empty()
-                && has_question_source
-                && !self.review_form.submission_paths.is_empty();
-            if ui
-                .add_enabled(can_submit, egui::Button::new("创建并执行审阅"))
-                .clicked()
-            {
-                self.spawn_create_review();
-            }
-        });
-    }
-
-    fn render_recent_jobs_summary(&mut self, ui: &mut Ui) {
-        section_card(ui, "最近任务", "先看近期任务进展，再进入详细复核。", |ui| {
-            if self.jobs.is_empty() {
-                ui.label("还没有审阅任务。");
-                return;
-            }
-
-            for job in self.jobs.iter().take(3) {
-                inner_panel_frame().show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(&job.title).strong());
-                        ui.label(
-                            RichText::new(format!("状态：{}", job.status))
-                                .color(status_color(&job.status)),
-                        );
-                    });
-                    ui.label(format!(
-                        "解析模式：{} · 提交数 {} · 评分制 {} 分",
-                        review_mode_label(&job.document_parse_mode),
-                        job.submissions.len(),
-                        job.score_scale
-                    ));
+                    }
                 });
-                ui.add_space(8.0);
-            }
-        });
-    }
-
-    fn render_runtime_panel(&mut self, ui: &mut Ui) {
-        section_card(ui, "服务控制与进程日志", "保留后端连接与运行轨迹。", |ui| {
-            ui.label(format!("本地后端状态：{}", self.backend_control.state));
-            if let Some(health) = &self.health {
-                ui.label(format!("数据库：{}", health.database_url));
-                ui.label(format!("存储目录：{}", health.storage_root));
-            } else {
-                ui.label("当前尚未从 API 获取到健康状态。");
-            }
-            ui.add_space(6.0);
-            ui.label("后端日志（最近 500 行）");
-            let mut log_text = self
-                .backend_control
-                .logs
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n");
-            ui.add(
-                TextEdit::multiline(&mut log_text)
-                    .desired_rows(10)
-                    .desired_width(f32::INFINITY)
-                    .font(egui::TextStyle::Monospace)
-                    .interactive(false),
-            );
-        });
-    }
-
-    fn render_recent_rename(&mut self, ui: &mut Ui) {
-        section_card(ui, "最近改名结果", "查看规则改名的预览或执行结果。", |ui| {
-            if let Some(result) = &self.rename_apply {
-                ui.label(format!(
-                    "已执行目录：{}，本次重命名 {} 个文件",
-                    result.directory_path, result.renamed_count
-                ));
-                rename_table(ui, &result.items);
-            } else if let Some(result) = &self.rename_preview {
-                ui.label(format!(
-                    "预览目录：{}，规则：{}",
-                    result.directory_path, result.rule.name
-                ));
-                rename_table(ui, &result.items);
-            } else {
-                ui.label("还没有改名结果。");
-            }
-        });
-    }
-
-    fn render_rename_agent_result(&mut self, ui: &mut Ui) {
-        section_card(ui, "Agent 改名结果", "展示命名分析、脚本和执行反馈。", |ui| {
-            if let Some(preview) = &self.rename_agent_preview {
-                ui.label(RichText::new("Agent 已生成命名统计、归一化模板和临时改名脚本").strong());
-                ui.label(format!("目录：{}", preview.directory_path));
-                ui.label(format!("规范要求：{}", preview.naming_rule));
-                ui.label(format!("归一化模板：{}", preview.normalized_template));
-                ui.label(format!("脚本路径：{}", preview.script_path));
-                if !preview.notes.is_empty() {
-                    for note in &preview.notes {
-                        ui.label(format!("说明：{note}"));
+            });
+            let ui = right;
+            section_card(ui, "名单初始化", "上传 Excel、PDF、图片等材料，由初始化 Agent 输出候选学生。", |ui| {
+                combo_box(ui, "roster-parse-mode", "识别模式", &mut self.roster_form.parse_mode, &ROSTER_PARSE_MODES);
+                ui.horizontal(|ui| {
+                    if ui.button("选择名单文件").clicked() {
+                        self.choose_roster_files();
+                    }
+                    if ui.button("清空文件").clicked() {
+                        self.roster_form.file_paths.clear();
+                    }
+                });
+                path_list(ui, &self.roster_form.file_paths);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("1. 创建批次").clicked() {
+                        self.spawn_create_roster_import();
+                    }
+                    if ui.button("2. 运行 Agent").clicked() {
+                        self.spawn_run_roster_import();
+                    }
+                    if ui.button("3. 批量接受候选").clicked() {
+                        self.spawn_confirm_roster_import();
+                    }
+                    if ui.button("4. 写入课程名单").clicked() {
+                        self.spawn_apply_roster_import();
+                    }
+                });
+                if let Some(batch) = &self.roster_batch {
+                    detail_line(ui, "批次", &batch.public_id);
+                    detail_line(ui, "状态", &batch.status);
+                    if let Some(error) = &batch.error_message {
+                        ui.colored_label(danger_color(), error);
                     }
                 }
-                if !preview.detected_patterns.is_empty() {
-                    ui.separator();
-                    ui.label(RichText::new("命名形式统计").strong());
-                    for pattern in &preview.detected_patterns {
-                        inner_panel_frame().show(ui, |ui| {
-                            ui.label(format!("风格：{}", pattern.style_key));
-                            ui.label(format!("数量：{}", pattern.count));
-                            ui.label(&pattern.description);
-                            if !pattern.examples.is_empty() {
-                                ui.label(format!("示例：{}", pattern.examples.join("；")));
-                            }
-                        });
-                        ui.add_space(6.0);
+            });
+            ui.add_space(12.0);
+            section_card(ui, "学生名单", "候选学生确认后会成为课程名单。", |ui| {
+                ui.label(format!("候选 {} · 已入课 {}", self.roster_candidates.len(), self.enrollments.len()));
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    if !self.roster_candidates.is_empty() {
+                        candidate_table(ui, &self.roster_candidates);
+                    } else {
+                        enrollment_table(ui, &self.enrollments);
                     }
-                }
-                ui.separator();
-                ui.label(RichText::new("脚本内容预览").strong());
-                let mut script_text = preview.script_content.clone();
-                ui.add(
-                    TextEdit::multiline(&mut script_text)
-                        .desired_rows(10)
-                        .desired_width(f32::INFINITY)
-                        .font(egui::TextStyle::Monospace)
-                        .interactive(false),
-                );
-                ui.separator();
-                ui.label(RichText::new("改名预览").strong());
-                rename_table(ui, &preview.items);
-            } else if let Some(analysis) = &self.rename_agent_analysis {
-                ui.label(RichText::new("已完成命名形式统计，等待进一步生成脚本").strong());
-                ui.label(format!("目录：{}", analysis.directory_path));
-                for note in &analysis.notes {
-                    ui.label(format!("说明：{note}"));
-                }
-                if !analysis.detected_patterns.is_empty() {
-                    ui.separator();
-                    for pattern in &analysis.detected_patterns {
-                        inner_panel_frame().show(ui, |ui| {
-                            ui.label(format!("风格：{}", pattern.style_key));
-                            ui.label(format!("数量：{}", pattern.count));
-                            ui.label(&pattern.description);
-                            if !pattern.examples.is_empty() {
-                                ui.label(format!("示例：{}", pattern.examples.join("；")));
-                            }
-                        });
-                        ui.add_space(6.0);
-                    }
-                }
-            } else {
-                ui.label("还没有 Agent 改名结果。");
-            }
-
-            if let Some(result) = &self.rename_agent_apply {
-                ui.separator();
-                ui.label(
-                    RichText::new(format!("已执行 Agent 脚本，本次改名 {} 个文件", result.renamed_count))
-                        .strong(),
-                );
-                ui.label(format!("脚本路径：{}", result.script_path));
-                rename_table(ui, &result.items);
-            }
+                });
+            });
         });
     }
 
-    fn render_job_selector(&mut self, ui: &mut Ui) {
-        section_card(ui, "任务列表与导出", "管理审阅任务并导出报告。", |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("导出当前任务 Markdown").clicked() {
-                    self.export_selected_job_markdown();
-                }
-                if ui.button("导出当前任务 JSON").clicked() {
-                    self.export_selected_job_json();
+    fn render_assignments_page(&mut self, ui: &mut Ui) {
+        two_columns(ui, |left, right| {
+            let ui = left;
+            section_card(ui, "创建作业", "作业是导入、命名和评审的独立单元。", |ui| {
+                self.render_course_selector(ui);
+                labeled_text(ui, "作业序号", &mut self.assignment_form.seq_no, "1");
+                labeled_text(ui, "标题", &mut self.assignment_form.title, "第一次作业");
+                labeled_multiline(ui, "说明", &mut self.assignment_form.description, "可选");
+                labeled_text(ui, "截止时间", &mut self.assignment_form.due_at, "可选，ISO 时间");
+                if ui.button("创建作业").clicked() {
+                    self.spawn_create_assignment();
                 }
             });
+            ui.add_space(12.0);
+            section_card(ui, "作业列表", "选择当前要处理的单次作业。", |ui| {
+                self.render_assignment_selector(ui);
+                if ui.button("加载作业上下文").clicked() {
+                    self.spawn_load_assignment_context();
+                }
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    for assignment in self.assignments.clone() {
+                        let selected = Some(&assignment.public_id) == self.selected_assignment_id.as_ref();
+                        if selectable_card(ui, selected, &format!("第 {} 次 · {}", assignment.seq_no, assignment.title), &assignment.status).clicked() {
+                            self.selected_assignment_id = Some(assignment.public_id);
+                            self.spawn_load_assignment_context();
+                        }
+                    }
+                });
+            });
+            let ui = right;
+            section_card(ui, "作业导入", "选择文件夹后由导入 Agent 匹配作业与学生。", |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(TextEdit::singleline(&mut self.submission_form.root_path).desired_width(360.0).hint_text("作业文件夹路径"));
+                    if ui.button("选择文件夹").clicked() {
+                        self.choose_submission_folder();
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("1. 创建批次").clicked() {
+                        self.spawn_create_submission_import();
+                    }
+                    if ui.button("2. 运行导入 Agent").clicked() {
+                        self.spawn_run_submission_import();
+                    }
+                    if ui.button("3. 批量确认匹配").clicked() {
+                        self.spawn_confirm_submission_import();
+                    }
+                    if ui.button("4. 应用导入").clicked() {
+                        self.spawn_apply_submission_import();
+                    }
+                });
+                if let Some(batch) = &self.submission_batch {
+                    detail_line(ui, "批次", &batch.public_id);
+                    detail_line(ui, "状态", &batch.status);
+                    detail_line(ui, "根目录", &batch.root_path);
+                }
+            });
+            ui.add_space(12.0);
+            section_card(ui, "提交记录", "展示 Agent 匹配结果、置信度和当前路径。", |ui| {
+                submission_table(ui, &self.submissions);
+            });
+        });
+    }
 
-            if self.jobs.is_empty() {
-                ui.label("还没有审阅任务。");
-                return;
-            }
-
-            for job in self.jobs.clone() {
-                inner_panel_frame().show(ui, |ui| {
+    fn render_naming_page(&mut self, ui: &mut Ui) {
+        two_columns(ui, |left, right| {
+            let ui = left;
+            section_card(ui, "命名策略", "可以写模板，也可以写自然语言规范交给命名 Agent 归一化。", |ui| {
+                self.render_assignment_selector(ui);
+                labeled_text(ui, "模板", &mut self.naming_form.template_text, "{assignment}_{student_no}_{name}");
+                labeled_multiline(ui, "文字规范", &mut self.naming_form.natural_language_rule, "说明命名规则");
+                if ui.button("创建/更新策略").clicked() {
+                    self.spawn_create_naming_policy();
+                }
+                policy_selector(ui, &self.naming_policies, &mut self.selected_policy_id);
+                if ui.button("生成命名计划").clicked() {
+                    self.spawn_create_naming_plan();
+                }
+            });
+            ui.add_space(12.0);
+            self.render_approval_card(ui, true);
+            let ui = right;
+            section_card(ui, "命名计划", "只展示计划和命令预览，审批前不会修改文件。", |ui| {
+                if let Some(plan) = &self.naming_plan {
+                    detail_line(ui, "计划", &plan.public_id);
+                    detail_line(ui, "状态", &plan.status);
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(&job.title).strong());
-                        ui.label(
-                            RichText::new(format!("状态：{}", job.status))
-                                .color(status_color(&job.status)),
-                        );
-                        let selected = Some(job.id) == self.selected_job_id;
-                        let label = if selected { "当前任务" } else { "查看详情" };
-                        if ui.button(label).clicked() {
-                            self.selected_job_id = Some(job.id);
-                            self.selected_submission_id = None;
-                            self.submission_logs.clear();
-                            self.manual_review_form = ManualReviewForm::default();
-                            self.active_page = WorkspacePage::ReviewDesk;
+                        if ui.button("提交审批").clicked() {
+                            self.spawn_submit_naming_approval();
+                        }
+                        if ui.button("审批后执行改名").clicked() {
+                            self.spawn_execute_naming_plan();
+                        }
+                        if ui.button("回滚改名").clicked() {
+                            self.spawn_rollback_naming_plan();
                         }
                     });
-                    ui.label(format!(
-                        "解析模式：{}，评分制：{} 分，提交数：{}",
-                        review_mode_label(&job.document_parse_mode),
-                        job.score_scale,
-                        job.submissions.len()
-                    ));
-                    ui.label(&job.question);
-                });
-                ui.add_space(8.0);
-            }
+                    naming_operation_table(ui, &plan.operations);
+                } else {
+                    empty_state(ui, "还没有命名计划", "先选择作业并生成命名计划。");
+                }
+            });
         });
     }
 
-    fn render_selected_job(&mut self, ui: &mut Ui) {
-        section_card(ui, "任务筛选与复核入口", "先筛选，再进入单份作业的人工复核。", |ui| {
-            let Some(job) = self.selected_job().cloned() else {
-                ui.label("请选择一个任务。");
-                return;
-            };
-
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(&job.title).heading());
-                ui.label(RichText::new(format!("状态：{}", job.status)).color(status_color(&job.status)));
-            });
-            ui.label(format!(
-                "模式：{} | 评分制：{} 分",
-                review_mode_label(&job.document_parse_mode),
-                job.score_scale
-            ));
-            if let Some(rubric) = &job.rubric {
-                ui.label(format!("评分规则：{rubric}"));
-            }
-
-            ui.separator();
-            ui.label("筛选条件");
-            ui.horizontal_wrapped(|ui| {
-                ui.label("关键词");
-                ui.add(TextEdit::singleline(&mut self.filter_form.keyword).desired_width(180.0));
-                combo_box(
-                    ui,
-                    "execution-filter",
-                    "执行状态",
-                    &mut self.filter_form.execution_status,
-                    &EXECUTION_STATUS_FILTERS,
-                );
-                combo_box(
-                    ui,
-                    "review-filter",
-                    "复核状态",
-                    &mut self.filter_form.review_status,
-                    &REVIEW_STATUS_FILTERS,
-                );
-            });
-            ui.checkbox(&mut self.filter_form.only_unmatched, "只看未匹配学生");
-
-            let filtered = self.filtered_submissions(&job);
-            ui.label(format!("筛选后共有 {} 份提交", filtered.len()));
-            if filtered.is_empty() {
-                ui.label("当前筛选条件下没有提交。");
-                return;
-            }
-
-            egui::ScrollArea::horizontal()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    egui::Grid::new("filtered-submissions-grid")
-                        .striped(true)
-                        .min_col_width(88.0)
-                        .show(ui, |ui| {
-                            ui.strong("文件");
-                            ui.strong("学生");
-                            ui.strong("匹配");
-                            ui.strong("分数");
-                            ui.strong("执行");
-                            ui.strong("复核");
-                            ui.strong("操作");
-                            ui.end_row();
-                            for submission in filtered {
-                                ui.label(&submission.original_filename);
-                                ui.label(submission.matched_student_name.as_deref().unwrap_or("-"));
-                                ui.label(format!(
-                                    "{} ({})",
-                                    submission.student_match_method.as_deref().unwrap_or("-"),
-                                    submission
-                                        .student_match_confidence
-                                        .map(|value| format!("{value:.0}"))
-                                        .unwrap_or_else(|| "-".to_owned())
-                                ));
-                                ui.label(
-                                    submission
-                                        .score
-                                        .map(|value| format!("{value:.2}/{}", submission.score_scale))
-                                        .unwrap_or_else(|| "-".to_owned()),
-                                );
-                                ui.label(
-                                    RichText::new(&submission.status)
-                                        .color(status_color(&submission.status)),
-                                );
-                                ui.label(
-                                    RichText::new(&submission.review_status)
-                                        .color(review_status_color(&submission.review_status)),
-                                );
-                                let selected = Some(submission.id) == self.selected_submission_id;
-                                if ui.button(if selected { "当前" } else { "打开复核" }).clicked() {
-                                    self.select_submission(submission.clone());
-                                }
-                                ui.end_row();
-                            }
-                        });
+    fn render_review_prep_page(&mut self, ui: &mut Ui) {
+        two_columns(ui, |left, right| {
+            let ui = left;
+            section_card(ui, "评审初始化", "上传题目、答案、评分规范等材料，评审初始化 Agent 生成结构化基线。", |ui| {
+                self.render_assignment_selector(ui);
+                ui.horizontal(|ui| {
+                    if ui.button("选择材料文件").clicked() {
+                        self.choose_review_materials();
+                    }
+                    if ui.button("清空材料").clicked() {
+                        self.review_prep_form.material_paths.clear();
+                    }
                 });
+                path_list(ui, &self.review_prep_form.material_paths);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("1. 创建初始化版本").clicked() {
+                        self.spawn_create_review_prep();
+                    }
+                    if ui.button("2. 运行初始化 Agent").clicked() {
+                        self.spawn_run_review_prep();
+                    }
+                    if ui.button("3. 确认基线").clicked() {
+                        self.spawn_confirm_review_prep();
+                    }
+                });
+                if let Some(prep) = &self.review_prep {
+                    detail_line(ui, "版本", &format!("v{} · {}", prep.version_no, prep.status));
+                    detail_line(ui, "ID", &prep.public_id);
+                }
+            });
+            ui.add_space(12.0);
+            section_card(ui, "题目项", "单题单题检查题目、答案和评分规范。", |ui| {
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    for item in self.review_questions.clone() {
+                        let selected = Some(&item.public_id) == self.selected_question_id.as_ref();
+                        if selectable_card(ui, selected, &format!("题 {} · {} 分", item.question_no, item.score_weight), &shorten(&item.question_full_text, 82)).clicked() {
+                            self.selected_question_id = Some(item.public_id);
+                            self.sync_question_form();
+                        }
+                    }
+                });
+            });
+            let ui = right;
+            section_card(ui, "题目编辑", "确认前可以人工修正 Agent 生成的结构化内容。", |ui| {
+                labeled_multiline(ui, "完整题目", &mut self.review_prep_form.question_text, "题目全文");
+                labeled_multiline(ui, "简洁答案", &mut self.review_prep_form.answer_short, "答案摘要");
+                labeled_multiline(ui, "完整答案", &mut self.review_prep_form.answer_full, "完整答案");
+                labeled_multiline(ui, "评分规范", &mut self.review_prep_form.rubric, "评分细则");
+                labeled_text(ui, "分值权重", &mut self.review_prep_form.score_weight, "100");
+                labeled_text(ui, "状态", &mut self.review_prep_form.status, "draft / ready");
+                if ui.button("保存题目项").clicked() {
+                    self.spawn_patch_review_question();
+                }
+            });
         });
     }
 
-    fn render_manual_review_panel(&mut self, ui: &mut Ui) {
-        section_card(ui, "人工复核面板", "对单份作业做最终确认并回写。", |ui| {
-            let Some(submission) = self.selected_submission().cloned() else {
-                ui.label("从上方任务表中选择一份作业，这里会显示复核表单。");
-                return;
-            };
-
-            self.sync_manual_review_form(&submission);
-
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(&submission.original_filename).strong());
-                ui.label(
-                    RichText::new(format!("执行状态：{}", submission.status))
-                        .color(status_color(&submission.status)),
-                );
-                ui.label(
-                    RichText::new(format!("复核状态：{}", submission.review_status))
-                        .color(review_status_color(&submission.review_status)),
-                );
+    fn render_review_run_page(&mut self, ui: &mut Ui) {
+        two_columns(ui, |left, right| {
+            let ui = left;
+            section_card(ui, "正式评审", "创建运行后，多 Agent 会按提交并行评分。", |ui| {
+                self.render_assignment_selector(ui);
+                labeled_text(ui, "并行数", &mut self.review_run_form.parallelism, "4");
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("1. 创建评审运行").clicked() {
+                        self.spawn_create_review_run();
+                    }
+                    if ui.button("2. 启动评审 Agent").clicked() {
+                        self.spawn_start_review_run();
+                    }
+                    if ui.button("刷新结果").clicked() {
+                        self.spawn_refresh_review_results();
+                    }
+                    if ui.button("重试失败项").clicked() {
+                        self.spawn_retry_review_run();
+                    }
+                    if ui.button("提交发布审批").clicked() {
+                        self.spawn_publish_review_run();
+                    }
+                });
+                if let Some(run) = &self.review_run {
+                    detail_line(ui, "运行", &run.public_id);
+                    detail_line(ui, "状态", &run.status);
+                    detail_line(ui, "并行", &run.parallelism.to_string());
+                }
             });
-            ui.label(format!(
-                "匹配学生：{} | 匹配方式：{} | 原始分数：{}",
-                submission.matched_student_name.as_deref().unwrap_or("-"),
-                submission.student_match_method.as_deref().unwrap_or("-"),
-                submission
-                    .score
-                    .map(|value| format!("{value:.2}/{}", submission.score_scale))
-                    .unwrap_or_else(|| "-".to_owned())
-            ));
-            if !submission.parser_notes.is_empty() {
-                ui.label(format!("解析备注：{}", submission.parser_notes.join("；")));
-            }
-
-            ui.separator();
-            ui.label("人工复核分数");
-            ui.add(TextEdit::singleline(&mut self.manual_review_form.score_input).desired_width(120.0));
-            combo_box(
-                ui,
-                "manual-review-status",
-                "人工复核结果",
-                &mut self.manual_review_form.review_status,
-                &MANUAL_REVIEW_STATUS_OPTIONS,
-            );
-            ui.label("人工复核总结");
-            ui.add(
-                TextEdit::multiline(&mut self.manual_review_form.review_summary)
-                    .desired_rows(4)
-                    .desired_width(f32::INFINITY),
-            );
-            ui.label("教师评语");
-            ui.add(
-                TextEdit::multiline(&mut self.manual_review_form.teacher_comment)
-                    .desired_rows(3)
-                    .desired_width(f32::INFINITY),
-            );
-            ui.horizontal_wrapped(|ui| {
+            ui.add_space(12.0);
+            section_card(ui, "评审结果", "选择一条结果可查看评分理由并人工复核。", |ui| {
+                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                    for result in self.review_results.clone() {
+                        let score = result.total_score.map(|value| format!("{value:.1}/{}", result.score_scale)).unwrap_or_else(|| "未评分".to_owned());
+                        let selected = Some(&result.public_id) == self.selected_result_id.as_ref();
+                        if selectable_card(ui, selected, &score, &format!("{} · {}", result.status, result.submission_public_id)).clicked() {
+                            self.selected_result_id = Some(result.public_id);
+                            self.sync_result_form();
+                        }
+                    }
+                });
+            });
+            let ui = right;
+            section_card(ui, "结果详情与复核", "人工复核会覆盖该结果的最终分数与说明。", |ui| {
+                if let Some(result) = self.selected_result() {
+                    detail_line(ui, "结果", &result.public_id);
+                    detail_line(ui, "提交", &result.submission_public_id);
+                    detail_line(ui, "状态", &result.status);
+                    ui.label(RichText::new("Agent 说明").small().color(subtle_text_color()));
+                    ui.label(result.summary.as_deref().unwrap_or("暂无说明"));
+                    if let Some(value) = &result.result {
+                        json_block(ui, value);
+                    }
+                } else {
+                    empty_state(ui, "还没有选中结果", "启动评审后选择结果进行复核。");
+                }
+                ui.separator();
+                labeled_text(ui, "人工分数", &mut self.review_run_form.manual_score, "0-100");
+                labeled_multiline(ui, "人工说明", &mut self.review_run_form.manual_summary, "复核理由");
+                labeled_text(ui, "人工决策", &mut self.review_run_form.manual_decision, "manual_reviewed");
                 if ui.button("保存人工复核").clicked() {
-                    self.spawn_save_manual_review();
+                    self.spawn_manual_review_result();
                 }
-                if ui.button("重置为当前提交内容").clicked() {
-                    self.sync_manual_review_form(&submission);
+            });
+            ui.add_space(12.0);
+            self.render_approval_card(ui, false);
+        });
+    }
+
+    fn render_audit_page(&mut self, ui: &mut Ui) {
+        two_columns(ui, |left, right| {
+            let ui = left;
+            section_card(ui, "Agent 调用", "记录 Agent 输入输出引用、模型、状态和错误。", |ui| {
+                if ui.button("刷新审计日志").clicked() {
+                    self.spawn_load_audit();
+                }
+                egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                    for run in self.agent_runs.clone() {
+                        let selected = Some(&run.public_id) == self.selected_agent_run_id.as_ref();
+                        if selectable_card(ui, selected, &format!("{} · {}", run.agent_name, run.status), &format!("{} / {}", run.graph_name, run.stage_name)).clicked() {
+                            self.selected_agent_run_id = Some(run.public_id);
+                            self.tool_calls.clear();
+                        }
+                    }
+                });
+            });
+            ui.add_space(12.0);
+            section_card(ui, "课程审计", "记录课程维度的上传、确认、执行等事件。", |ui| {
+                audit_table(ui, &self.audit_events);
+            });
+            let ui = right;
+            section_card(ui, "调用详情", "工具调用和结构化输出引用集中查看。", |ui| {
+                if let Some(run) = self.selected_agent_run() {
+                    detail_line(ui, "Agent", &run.agent_name);
+                    detail_line(ui, "图", &run.graph_name);
+                    detail_line(ui, "阶段", &run.stage_name);
+                    detail_line(ui, "状态", &run.status);
+                    if let Some(error) = &run.error_message {
+                        ui.colored_label(danger_color(), error);
+                    }
+                    if ui.button("加载工具调用").clicked() {
+                        self.spawn_load_tool_calls();
+                    }
+                    ui.separator();
+                    for call in &self.tool_calls {
+                        inner_panel_frame().show(ui, |ui| {
+                            ui.label(RichText::new(&call.tool_name).strong());
+                            ui.label(format!("状态：{} · 退出码：{}", call.status, call.exit_code.map(|value| value.to_string()).unwrap_or_else(|| "-".to_owned())));
+                            if let Some(command) = &call.command_text {
+                                ui.monospace(command);
+                            }
+                        });
+                    }
+                } else {
+                    empty_state(ui, "没有 Agent 调用", "点击刷新审计日志。");
                 }
             });
         });
     }
 
-    fn render_selected_logs(&mut self, ui: &mut Ui) {
-        section_card(ui, "单份作业日志", "查看该作业的处理轨迹和载荷。", |ui| {
-            let Some(submission) = self.selected_submission().cloned() else {
-                ui.label("点击“打开复核”后，这里会展示单份作业的处理过程。");
-                return;
-            };
-
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(&submission.original_filename).strong());
-                ui.label(RichText::new(format!("状态：{}", submission.status)).color(status_color(&submission.status)));
-                if let Some(name) = &submission.matched_student_name {
-                    ui.label(format!("学生：{name}"));
+    fn render_settings_page(&mut self, ui: &mut Ui) {
+        two_columns(ui, |left, right| {
+            let ui = left;
+            section_card(ui, "连接设置", "业务功能与运行设置分离，避免所有选项堆在一个界面。", |ui| {
+                labeled_text(ui, "后端地址", &mut self.backend_url, "http://127.0.0.1:18080");
+                if ui.button("检测连接").clicked() {
+                    self.spawn_task("检测连接", |api| Ok(vec![WorkerEvent::SnapshotLoaded(DashboardSnapshot { health: Some(api.health()?), courses: api.list_courses().unwrap_or_default() })]));
+                }
+                if let Some(health) = &self.health {
+                    detail_line(ui, "应用", &health.app_name);
+                    detail_line(ui, "数据库", &health.database_url);
+                    detail_line(ui, "运行目录", &health.runtime_root);
+                    detail_line(ui, "LLM", if health.llm_enabled { "已启用" } else { "未启用" });
                 }
             });
-            ui.label(format!(
-                "解析器：{} | 图片数：{} | 分数：{} | 教师评语：{}",
-                submission.parser_name.as_deref().unwrap_or("-"),
-                submission.images_detected,
-                submission
-                    .score
-                    .map(|value| format!("{value:.2}/{}", submission.score_scale))
-                    .unwrap_or_else(|| "-".to_owned()),
-                submission.teacher_comment.as_deref().unwrap_or("-"),
-            ));
-            if let Some(summary) = &submission.review_summary {
-                ui.label(format!("总结：{summary}"));
-            }
-
-            if self.submission_logs.is_empty() {
-                ui.label("当前提交还没有日志，或日志尚未加载。");
-                return;
-            }
-
-            for log in &self.submission_logs {
-                inner_panel_frame().show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(&log.stage).strong());
-                        ui.label(RichText::new(&log.level).color(level_color(&log.level)));
-                        ui.label(RichText::new(&log.created_at).small().color(subtle_text_color()));
-                    });
-                    ui.label(&log.message);
-                    if let Some(payload) = &log.payload {
-                        let mut payload_text = json_string(payload);
-                        ui.add(
-                            TextEdit::multiline(&mut payload_text)
-                                .desired_rows(4)
-                                .desired_width(f32::INFINITY)
-                                .font(egui::TextStyle::Monospace)
-                                .interactive(false),
-                        );
+            ui.add_space(12.0);
+            section_card(ui, "本地后端", "桌面端可以托管后端进程，也可以连接外部后端。", |ui| {
+                labeled_text(ui, "后端目录", &mut self.backend_control.backend_dir, "backend 目录");
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("启动后端").clicked() {
+                        self.start_backend_process();
+                    }
+                    if ui.button("停止后端").clicked() {
+                        self.stop_backend_process();
+                    }
+                    if ui.button("重启后端").clicked() {
+                        self.restart_backend_process();
                     }
                 });
-                ui.add_space(8.0);
+                detail_line(ui, "状态", &self.backend_control.state);
+            });
+            let ui = right;
+            section_card(ui, "后端日志", "只显示桌面端托管进程的 stdout/stderr。", |ui| {
+                egui::ScrollArea::vertical().max_height(560.0).stick_to_bottom(true).show(ui, |ui| {
+                    for line in &self.backend_control.logs {
+                        ui.monospace(line);
+                    }
+                });
+            });
+        });
+    }
+
+    fn render_course_selector(&mut self, ui: &mut Ui) {
+        ui.label(RichText::new("课程").small().color(subtle_text_color()));
+        egui::ComboBox::from_id_salt("course-selector")
+            .selected_text(self.selected_course().map(|course| course.course_name.clone()).unwrap_or_else(|| "请选择课程".to_owned()))
+            .show_ui(ui, |ui| {
+                for course in &self.courses {
+                    ui.selectable_value(&mut self.selected_course_id, Some(course.public_id.clone()), format!("{} · {}", course.course_code, course.course_name));
+                }
+            });
+    }
+
+    fn render_assignment_selector(&mut self, ui: &mut Ui) {
+        ui.label(RichText::new("作业").small().color(subtle_text_color()));
+        egui::ComboBox::from_id_salt("assignment-selector")
+            .selected_text(self.selected_assignment().map(|item| format!("第 {} 次 · {}", item.seq_no, item.title)).unwrap_or_else(|| "请选择作业".to_owned()))
+            .show_ui(ui, |ui| {
+                for assignment in &self.assignments {
+                    ui.selectable_value(&mut self.selected_assignment_id, Some(assignment.public_id.clone()), format!("第 {} 次 · {}", assignment.seq_no, assignment.title));
+                }
+            });
+    }
+
+    fn render_approval_card(&mut self, ui: &mut Ui, naming_mode: bool) {
+        section_card(ui, "审批控制", "高风险副作用必须先审批，再执行。", |ui| {
+            if let Some(task) = &self.active_approval {
+                detail_line(ui, "审批", &task.public_id);
+                detail_line(ui, "标题", &task.title);
+                detail_line(ui, "动作", &format!("{} / {}", task.object_type, task.action_type));
+                detail_line(ui, "状态", &task.status);
+                if let Some(summary) = &task.summary {
+                    ui.label(summary);
+                }
+                labeled_multiline(ui, "审批备注", if naming_mode { &mut self.naming_form.approval_note } else { &mut self.review_run_form.publish_note }, "说明批准或拒绝原因");
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("批准").clicked() {
+                        self.spawn_approve_active_task();
+                    }
+                    if ui.button("拒绝").clicked() {
+                        self.spawn_reject_active_task();
+                    }
+                    if !naming_mode && ui.button("执行发布副作用").clicked() {
+                        self.spawn_execute_active_approval();
+                    }
+                });
+                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                    for command in &task.command_preview {
+                        json_block(ui, command);
+                    }
+                });
+            } else {
+                empty_state(ui, "暂无审批任务", "命名计划或发布结果提交后会显示在这里。");
             }
         });
     }
@@ -1861,32 +1694,18 @@ impl eframe::App for AssistantApp {
         self.drain_events();
 
         egui::TopBottomPanel::top("toolbar")
-            .frame(
-                egui::Frame::new()
-                    .inner_margin(Margin::symmetric(18, 14))
-                    .fill(toolbar_color())
-                    .stroke(Stroke::new(1.0, border_color())),
-            )
+            .frame(egui::Frame::new().fill(toolbar_color()).inner_margin(Margin::symmetric(18, 14)).stroke(Stroke::new(1.0, border_color())))
             .show(ctx, |ui| self.toolbar(ui));
 
         egui::SidePanel::left("sidebar")
             .resizable(true)
-            .default_width(230.0)
-            .min_width(180.0)
-            .frame(
-                egui::Frame::new()
-                    .inner_margin(Margin::same(16))
-                    .fill(sidebar_color())
-                    .stroke(Stroke::new(1.0, border_color())),
-            )
+            .default_width(220.0)
+            .width_range(172.0..=300.0)
+            .frame(egui::Frame::new().fill(sidebar_color()).inner_margin(Margin::same(14)).stroke(Stroke::new(1.0, border_color())))
             .show(ctx, |ui| self.navigation_panel(ui));
 
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .inner_margin(Margin::same(16))
-                    .fill(canvas_color()),
-            )
+            .frame(egui::Frame::new().fill(canvas_color()).inner_margin(Margin::same(14)))
             .show(ctx, |ui| self.workspace_panel(ui));
     }
 }
@@ -1899,77 +1718,64 @@ impl Drop for AssistantApp {
 
 fn apply_macos_theme(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = egui::vec2(12.0, 12.0);
-    style.spacing.button_padding = egui::vec2(14.0, 10.0);
-    style.spacing.interact_size = egui::vec2(40.0, 36.0);
-    style.spacing.text_edit_width = 280.0;
-    style.spacing.combo_width = 220.0;
-    style.spacing.indent = 18.0;
+    style.spacing.item_spacing = egui::vec2(11.0, 10.0);
+    style.spacing.button_padding = egui::vec2(13.0, 9.0);
+    style.spacing.interact_size = egui::vec2(36.0, 32.0);
+    style.spacing.text_edit_width = 260.0;
+    style.spacing.combo_width = 240.0;
     style.visuals = egui::Visuals::light();
     style.visuals.override_text_color = Some(text_primary_color());
     style.visuals.panel_fill = canvas_color();
     style.visuals.window_fill = surface_color();
     style.visuals.extreme_bg_color = surface_alt_color();
     style.visuals.faint_bg_color = soft_tint(border_color());
-    style.visuals.code_bg_color = surface_alt_color();
     style.visuals.window_corner_radius = CornerRadius::same(22);
-    style.visuals.menu_corner_radius = CornerRadius::same(16);
     style.visuals.window_stroke = Stroke::new(1.0, border_color());
     style.visuals.widgets.noninteractive.bg_fill = surface_color();
-    style.visuals.widgets.noninteractive.weak_bg_fill = surface_color();
     style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, border_color());
-    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text_primary_color());
     style.visuals.widgets.noninteractive.corner_radius = CornerRadius::same(14);
     style.visuals.widgets.inactive.bg_fill = surface_color();
     style.visuals.widgets.inactive.weak_bg_fill = surface_alt_color();
     style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, border_color());
-    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, text_primary_color());
     style.visuals.widgets.inactive.corner_radius = CornerRadius::same(14);
     style.visuals.widgets.hovered.bg_fill = surface_alt_color();
     style.visuals.widgets.hovered.weak_bg_fill = soft_tint(accent_color());
     style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, accent_color());
-    style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, text_primary_color());
     style.visuals.widgets.hovered.corner_radius = CornerRadius::same(14);
     style.visuals.widgets.active.bg_fill = soft_tint(accent_color());
-    style.visuals.widgets.active.weak_bg_fill = soft_tint(accent_color());
     style.visuals.widgets.active.bg_stroke = Stroke::new(1.0, accent_color());
-    style.visuals.widgets.active.fg_stroke = Stroke::new(1.0, accent_color());
     style.visuals.widgets.active.corner_radius = CornerRadius::same(14);
     style.visuals.widgets.open = style.visuals.widgets.hovered;
     style.visuals.selection.bg_fill = accent_color();
     style.visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
-    style.text_styles.insert(
-        egui::TextStyle::Heading,
-        FontId::new(24.0, FontFamily::Proportional),
-    );
-    style.text_styles.insert(
-        egui::TextStyle::Body,
-        FontId::new(15.0, FontFamily::Proportional),
-    );
-    style.text_styles.insert(
-        egui::TextStyle::Button,
-        FontId::new(14.0, FontFamily::Proportional),
-    );
-    style.text_styles.insert(
-        egui::TextStyle::Small,
-        FontId::new(12.0, FontFamily::Proportional),
-    );
+    style.text_styles.insert(egui::TextStyle::Heading, FontId::new(24.0, FontFamily::Proportional));
+    style.text_styles.insert(egui::TextStyle::Body, FontId::new(14.5, FontFamily::Proportional));
+    style.text_styles.insert(egui::TextStyle::Button, FontId::new(14.0, FontFamily::Proportional));
+    style.text_styles.insert(egui::TextStyle::Small, FontId::new(12.0, FontFamily::Proportional));
     ctx.set_style(style);
 }
 
-fn section_card<R>(
-    ui: &mut Ui,
-    title: &str,
-    subtitle: &str,
-    add_contents: impl FnOnce(&mut Ui) -> R,
-) -> R {
+fn install_cjk_font(ctx: &egui::Context) {
+    let mut fonts = FontDefinitions::default();
+    fonts.font_data.insert(
+        CJK_FONT_NAME.to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/NotoSansCJKsc-Regular.otf")).into(),
+    );
+    fonts.families.entry(FontFamily::Proportional).or_default().insert(0, CJK_FONT_NAME.to_owned());
+    fonts.families.entry(FontFamily::Monospace).or_default().insert(0, CJK_FONT_NAME.to_owned());
+    ctx.set_fonts(fonts);
+}
+
+fn section_card<R>(ui: &mut Ui, title: &str, subtitle: &str, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
     egui::Frame::new()
         .fill(surface_color())
         .stroke(Stroke::new(1.0, border_color()))
         .corner_radius(CornerRadius::same(20))
-        .inner_margin(Margin::same(16))
+        .inner_margin(Margin::same(15))
         .show(ui, |ui| {
-            ui.label(RichText::new(title).size(20.0).strong().color(text_primary_color()));
+            if !title.is_empty() {
+                ui.label(RichText::new(title).size(19.0).strong().color(text_primary_color()));
+            }
             if !subtitle.is_empty() {
                 ui.label(RichText::new(subtitle).color(subtle_text_color()));
                 ui.add_space(8.0);
@@ -1987,25 +1793,44 @@ fn inner_panel_frame() -> egui::Frame {
         .inner_margin(Margin::same(12))
 }
 
+fn two_columns(ui: &mut Ui, contents: impl FnOnce(&mut Ui, &mut Ui)) {
+    ui.columns(2, |columns| {
+        let (left_slice, right_slice) = columns.split_at_mut(1);
+        contents(&mut left_slice[0], &mut right_slice[0]);
+    });
+}
+
 fn navigation_button(ui: &mut Ui, page: WorkspacePage, selected: bool) -> egui::Response {
-    let fill = if selected {
-        soft_tint(accent_color())
-    } else {
-        surface_color()
-    };
-    let stroke_color = if selected { accent_color() } else { border_color() };
-    let text_color = if selected {
-        accent_color()
-    } else {
-        text_primary_color()
-    };
+    let fill = if selected { soft_tint(accent_color()) } else { Color32::TRANSPARENT };
+    let stroke_color = if selected { accent_color() } else { Color32::TRANSPARENT };
+    let text_color = if selected { accent_color() } else { text_primary_color() };
     ui.add_sized(
-        [ui.available_width(), 42.0],
+        [ui.available_width(), 38.0],
         egui::Button::new(RichText::new(page.title()).color(text_color).strong())
             .fill(fill)
             .stroke(Stroke::new(1.0, stroke_color))
-            .corner_radius(CornerRadius::same(14)),
+            .corner_radius(CornerRadius::same(13)),
     )
+}
+
+fn selectable_card(ui: &mut Ui, selected: bool, title: &str, subtitle: &str) -> egui::Response {
+    let fill = if selected { soft_tint(accent_color()) } else { surface_alt_color() };
+    let stroke = if selected { accent_color() } else { border_color() };
+    let response = egui::Frame::new()
+        .fill(fill)
+        .stroke(Stroke::new(1.0, stroke))
+        .corner_radius(CornerRadius::same(15))
+        .inner_margin(Margin::same(12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(title).strong().color(text_primary_color()));
+            if !subtitle.is_empty() {
+                ui.label(RichText::new(subtitle).small().color(subtle_text_color()));
+            }
+        })
+        .response;
+    ui.add_space(6.0);
+    response.interact(egui::Sense::click())
 }
 
 fn status_chip(ui: &mut Ui, label: &str, value: &str, color: Color32) {
@@ -2022,14 +1847,31 @@ fn status_chip(ui: &mut Ui, label: &str, value: &str, color: Color32) {
         });
 }
 
-fn combo_box(
-    ui: &mut Ui,
-    id: &str,
-    label: &str,
-    current: &mut String,
-    options: &[(&str, &str)],
-) {
-    ui.label(label);
+fn metric_card(ui: &mut Ui, title: &str, value: &str, help: &str) {
+    inner_panel_frame().show(ui, |ui| {
+        ui.set_min_width(130.0);
+        ui.label(RichText::new(title).small().color(subtle_text_color()));
+        ui.label(RichText::new(value).size(22.0).strong().color(text_primary_color()));
+        ui.label(RichText::new(help).small().color(subtle_text_color()));
+    });
+}
+
+fn lifecycle_card(ui: &mut Ui, index: &str, title: &str, status: &str, help: &str) {
+    inner_panel_frame().show(ui, |ui| {
+        ui.set_min_width(154.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(index).size(22.0).strong().color(accent_color()));
+            ui.vertical(|ui| {
+                ui.label(RichText::new(title).strong());
+                ui.colored_label(status_color(status), status);
+            });
+        });
+        ui.label(RichText::new(help).small().color(subtle_text_color()));
+    });
+}
+
+fn combo_box(ui: &mut Ui, id: &str, label: &str, current: &mut String, options: &[(&str, &str)]) {
+    ui.label(RichText::new(label).small().color(subtle_text_color()));
     egui::ComboBox::from_id_salt(id)
         .selected_text(mode_label(current, options))
         .show_ui(ui, |ui| {
@@ -2039,84 +1881,150 @@ fn combo_box(
         });
 }
 
-fn combo_box_rule(ui: &mut Ui, rules: &[RenameRuleRead], selected_rule_id: &mut Option<i64>) {
-    ui.label("规则");
-    egui::ComboBox::from_id_salt("rule-select")
+fn policy_selector(ui: &mut Ui, policies: &[NamingPolicyRead], selected_policy_id: &mut Option<String>) {
+    ui.label(RichText::new("已有策略").small().color(subtle_text_color()));
+    egui::ComboBox::from_id_salt("policy-selector")
         .selected_text(
-            rules.iter()
-                .find(|rule| Some(rule.id) == *selected_rule_id)
-                .map(|rule| rule.name.clone())
-                .unwrap_or_else(|| "请选择规则".to_owned()),
+            policies
+                .iter()
+                .find(|policy| Some(&policy.public_id) == selected_policy_id.as_ref())
+                .map(|policy| format!("v{} · {}", policy.version_no, policy.template_text))
+                .unwrap_or_else(|| "不使用已有策略".to_owned()),
         )
         .show_ui(ui, |ui| {
-            for rule in rules {
-                ui.selectable_value(
-                    selected_rule_id,
-                    Some(rule.id),
-                    format!("{} ({})", rule.name, rule.template),
-                );
+            ui.selectable_value(selected_policy_id, None, "不使用已有策略");
+            for policy in policies {
+                ui.selectable_value(selected_policy_id, Some(policy.public_id.clone()), format!("v{} · {}", policy.version_no, policy.template_text));
             }
         });
 }
 
-fn metric_card(ui: &mut Ui, title: &str, value: &str, help: &str) {
-    inner_panel_frame().show(ui, |ui| {
-        ui.set_min_width(156.0);
-        ui.label(RichText::new(title).small().color(subtle_text_color()));
-        ui.label(RichText::new(value).size(24.0).strong().color(text_primary_color()));
-        ui.label(RichText::new(help).small().color(subtle_text_color()));
+fn labeled_text(ui: &mut Ui, label: &str, value: &mut String, hint: &str) {
+    ui.label(RichText::new(label).small().color(subtle_text_color()));
+    ui.add(TextEdit::singleline(value).desired_width(f32::INFINITY).hint_text(hint));
+}
+
+fn labeled_multiline(ui: &mut Ui, label: &str, value: &mut String, hint: &str) {
+    ui.label(RichText::new(label).small().color(subtle_text_color()));
+    ui.add(TextEdit::multiline(value).desired_width(f32::INFINITY).desired_rows(4).hint_text(hint));
+}
+
+fn detail_line(ui: &mut Ui, label: &str, value: &str) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(label).small().color(subtle_text_color()));
+        ui.label(RichText::new(value).color(text_primary_color()));
     });
 }
 
-fn install_cjk_font(ctx: &egui::Context) {
-    let mut fonts = FontDefinitions::default();
-    fonts.font_data.insert(
-        CJK_FONT_NAME.to_owned(),
-        egui::FontData::from_static(include_bytes!("../assets/NotoSansCJKsc-Regular.otf")).into(),
-    );
-    fonts
-        .families
-        .entry(FontFamily::Proportional)
-        .or_default()
-        .insert(0, CJK_FONT_NAME.to_owned());
-    fonts
-        .families
-        .entry(FontFamily::Monospace)
-        .or_default()
-        .insert(0, CJK_FONT_NAME.to_owned());
-    ctx.set_fonts(fonts);
+fn path_list(ui: &mut Ui, paths: &[String]) {
+    if paths.is_empty() {
+        ui.label(RichText::new("未选择文件。 ").color(subtle_text_color()));
+        return;
+    }
+    egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+        for path in paths {
+            ui.monospace(path);
+        }
+    });
 }
 
-fn rename_table(ui: &mut Ui, items: &[RenamePreviewItem]) {
-    egui::ScrollArea::horizontal()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            egui::Grid::new("rename-grid")
-                .striped(true)
-                .min_col_width(90.0)
-                .show(ui, |ui| {
-                    ui.strong("原文件");
-                    ui.strong("目标文件");
-                    ui.strong("匹配学生");
-                    ui.strong("置信度");
-                    ui.strong("状态");
-                    ui.strong("说明");
-                    ui.end_row();
-                    for item in items {
-                        ui.label(&item.source_path);
-                        ui.label(item.target_path.as_deref().unwrap_or("-"));
-                        ui.label(item.matched_student.as_deref().unwrap_or("-"));
-                        ui.label(format!("{:.2}", item.confidence));
-                        ui.label(RichText::new(&item.status).color(status_color(&item.status)));
-                        ui.label(item.reason.as_deref().unwrap_or("-"));
-                        ui.end_row();
-                    }
-                });
+fn candidate_table(ui: &mut Ui, items: &[RosterCandidateRead]) {
+    egui::Grid::new("roster-candidates-grid").striped(true).min_col_width(80.0).show(ui, |ui| {
+        ui.strong("学号");
+        ui.strong("姓名");
+        ui.strong("置信度");
+        ui.strong("状态");
+        ui.end_row();
+        for item in items {
+            ui.label(item.student_no.as_deref().unwrap_or("-"));
+            ui.label(&item.name);
+            ui.label(format!("{:.2}", item.confidence));
+            ui.colored_label(status_color(&item.decision_status), &item.decision_status);
+            ui.end_row();
+        }
+    });
+}
+
+fn enrollment_table(ui: &mut Ui, items: &[CourseEnrollmentRead]) {
+    egui::Grid::new("enrollments-grid").striped(true).min_col_width(100.0).show(ui, |ui| {
+        ui.strong("学号");
+        ui.strong("姓名");
+        ui.strong("状态");
+        ui.end_row();
+        for item in items {
+            ui.label(item.display_student_no.as_deref().unwrap_or("-"));
+            ui.label(&item.display_name);
+            ui.colored_label(status_color(&item.status), &item.status);
+            ui.end_row();
+        }
+    });
+}
+
+fn submission_table(ui: &mut Ui, items: &[SubmissionRead]) {
+    egui::ScrollArea::horizontal().show(ui, |ui| {
+        egui::Grid::new("submissions-grid").striped(true).min_col_width(110.0).show(ui, |ui| {
+            ui.strong("文件");
+            ui.strong("状态");
+            ui.strong("匹配");
+            ui.strong("置信度");
+            ui.strong("当前路径");
+            ui.end_row();
+            for item in items {
+                ui.label(&item.source_entry_name);
+                ui.colored_label(status_color(&item.status), &item.status);
+                ui.label(item.enrollment_public_id.as_deref().unwrap_or("未匹配"));
+                ui.label(item.match_confidence.map(|value| format!("{value:.2}")).unwrap_or_else(|| "-".to_owned()));
+                ui.monospace(shorten(&item.current_path, 72));
+                ui.end_row();
+            }
         });
+    });
 }
 
-fn review_mode_label(value: &str) -> String {
-    mode_label(value, &REVIEW_PARSE_MODES)
+fn naming_operation_table(ui: &mut Ui, items: &[crate::models::NamingOperationRead]) {
+    egui::ScrollArea::horizontal().max_height(460.0).show(ui, |ui| {
+        egui::Grid::new("naming-operations-grid").striped(true).min_col_width(130.0).show(ui, |ui| {
+            ui.strong("状态");
+            ui.strong("原路径");
+            ui.strong("目标路径");
+            ui.strong("命令预览");
+            ui.end_row();
+            for item in items {
+                ui.colored_label(status_color(&item.status), &item.status);
+                ui.monospace(shorten(&item.source_path, 58));
+                ui.monospace(shorten(&item.target_path, 58));
+                ui.monospace(item.command_preview.as_deref().unwrap_or("-"));
+                ui.end_row();
+            }
+        });
+    });
+}
+
+fn audit_table(ui: &mut Ui, items: &[AuditEventRead]) {
+    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+        for item in items {
+            inner_panel_frame().show(ui, |ui| {
+                ui.label(RichText::new(&item.event_type).strong());
+                ui.label(format!("{} · {} · {}", item.object_type, item.object_public_id, item.created_at));
+                if let Some(payload) = &item.event_payload_json {
+                    json_block(ui, payload);
+                }
+            });
+            ui.add_space(6.0);
+        }
+    });
+}
+
+fn empty_state(ui: &mut Ui, title: &str, help: &str) {
+    inner_panel_frame().show(ui, |ui| {
+        ui.label(RichText::new(title).strong().color(text_primary_color()));
+        ui.label(RichText::new(help).color(subtle_text_color()));
+    });
+}
+
+fn json_block(ui: &mut Ui, value: &serde_json::Value) {
+    let mut text = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+    ui.add(TextEdit::multiline(&mut text).font(egui::TextStyle::Monospace).desired_rows(4).desired_width(f32::INFINITY).interactive(false));
 }
 
 fn mode_label(value: &str, options: &[(&str, &str)]) -> String {
@@ -2129,27 +2037,9 @@ fn mode_label(value: &str, options: &[(&str, &str)]) -> String {
 
 fn status_color(status: &str) -> Color32 {
     match status {
-        "completed" | "pass" | "renamed" => success_color(),
-        "running" | "pending" | "ready" => warning_color(),
-        "failed" | "partial_failed" | "needs_revision" | "error" => danger_color(),
-        _ => muted_chip_color(),
-    }
-}
-
-fn review_status_color(status: &str) -> Color32 {
-    match status {
-        "reviewed" => accent_color(),
-        "needs_followup" => danger_color(),
-        "auto_reviewed" => muted_chip_color(),
-        _ => muted_chip_color(),
-    }
-}
-
-fn level_color(level: &str) -> Color32 {
-    match level {
-        "info" => accent_color(),
-        "warning" => warning_color(),
-        "error" => danger_color(),
+        "active" | "applied" | "ready" | "completed" | "confirmed" | "approved" | "executed" | "published" | "renamed" | "finalized" => success_color(),
+        "draft" | "pending" | "queued" | "running" | "generated" | "pending_approval" | "executing" | "naming_ready" | "reviewing" => warning_color(),
+        "failed" | "error" | "rejected" | "conflicted" | "needs_manual_review" | "unmatched" => danger_color(),
         _ => muted_chip_color(),
     }
 }
@@ -2159,55 +2049,55 @@ fn canvas_color() -> Color32 {
 }
 
 fn toolbar_color() -> Color32 {
-    Color32::from_rgb(246, 247, 249)
+    Color32::from_rgb(248, 249, 251)
 }
 
 fn sidebar_color() -> Color32 {
-    Color32::from_rgb(237, 240, 244)
+    Color32::from_rgb(236, 239, 244)
 }
 
 fn surface_color() -> Color32 {
-    Color32::from_rgb(252, 252, 253)
+    Color32::from_rgb(253, 253, 254)
 }
 
 fn surface_alt_color() -> Color32 {
-    Color32::from_rgb(245, 247, 250)
+    Color32::from_rgb(246, 248, 251)
 }
 
 fn border_color() -> Color32 {
-    Color32::from_rgb(218, 223, 230)
+    Color32::from_rgb(219, 224, 232)
 }
 
 fn text_primary_color() -> Color32 {
-    Color32::from_rgb(39, 44, 52)
+    Color32::from_rgb(35, 39, 48)
 }
 
 fn subtle_text_color() -> Color32 {
-    Color32::from_rgb(111, 118, 130)
+    Color32::from_rgb(108, 116, 130)
 }
 
 fn accent_color() -> Color32 {
-    Color32::from_rgb(79, 111, 201)
+    Color32::from_rgb(49, 101, 194)
 }
 
 fn success_color() -> Color32 {
-    Color32::from_rgb(49, 132, 92)
+    Color32::from_rgb(42, 130, 88)
 }
 
 fn warning_color() -> Color32 {
-    Color32::from_rgb(201, 129, 48)
+    Color32::from_rgb(193, 128, 46)
 }
 
 fn danger_color() -> Color32 {
-    Color32::from_rgb(191, 75, 75)
+    Color32::from_rgb(190, 73, 72)
 }
 
 fn muted_chip_color() -> Color32 {
-    Color32::from_rgb(134, 142, 154)
+    Color32::from_rgb(132, 141, 156)
 }
 
 fn soft_tint(color: Color32) -> Color32 {
-    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 28)
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 26)
 }
 
 fn trimmed_option(value: &str) -> Option<String> {
@@ -2219,22 +2109,32 @@ fn trimmed_option(value: &str) -> Option<String> {
     }
 }
 
-fn json_string(value: &serde_json::Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+fn shorten(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_owned();
+    }
+    let mut text: String = value.chars().take(limit.saturating_sub(1)).collect();
+    text.push('…');
+    text
 }
 
-fn sanitize_filename(name: &str) -> String {
-    name.chars()
-        .map(|ch| match ch {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            _ => ch,
+fn push_unique_path(paths: &mut Vec<String>, path: String) {
+    if !paths.contains(&path) {
+        paths.push(path);
+    }
+}
+
+fn detect_backend_dir() -> PathBuf {
+    std::env::current_dir()
+        .ok()
+        .map(|cwd| {
+            if cwd.file_name().and_then(|name| name.to_str()) == Some("frontend") {
+                cwd.parent().unwrap_or(&cwd).join("backend")
+            } else {
+                cwd.join("backend")
+            }
         })
-        .collect()
-}
-
-fn shell_quote(path: &Path) -> String {
-    let text = path.display().to_string().replace('\'', "'\"'\"'");
-    format!("'{text}'")
+        .unwrap_or_else(|| PathBuf::from("backend"))
 }
 
 fn spawn_backend_reader<R: Read + Send + 'static>(reader: R, sender: Sender<WorkerEvent>, prefix: &'static str) {
@@ -2243,117 +2143,13 @@ fn spawn_backend_reader<R: Read + Send + 'static>(reader: R, sender: Sender<Work
         for line in buffered.lines() {
             match line {
                 Ok(content) => {
-                    sender
-                        .send(WorkerEvent::BackendLogLine(format!("[{prefix}] {content}")))
-                        .ok();
+                    sender.send(WorkerEvent::BackendLogLine(format!("[{prefix}] {content}"))).ok();
                 }
                 Err(err) => {
-                    sender
-                        .send(WorkerEvent::BackendLogLine(format!("[{prefix}] 读取日志失败：{err}")))
-                        .ok();
+                    sender.send(WorkerEvent::BackendLogLine(format!("[{prefix}] 读取日志失败：{err}"))).ok();
                     break;
                 }
             }
         }
     });
-}
-
-fn detect_backend_dir() -> PathBuf {
-    let candidates = {
-        let mut result = Vec::new();
-        if let Ok(current) = std::env::current_dir() {
-            result.push(current.join("../backend"));
-            result.push(current.join("backend"));
-        }
-        if let Ok(exe) = std::env::current_exe() {
-            for ancestor in exe.ancestors() {
-                result.push(ancestor.join("backend"));
-                result.push(ancestor.join("../backend"));
-            }
-        }
-        result
-    };
-
-    for candidate in candidates {
-        if candidate.is_dir() && candidate.join("pyproject.toml").exists() {
-            return candidate.canonicalize().unwrap_or(candidate);
-        }
-    }
-
-    PathBuf::from("../backend")
-}
-
-fn build_markdown_report(
-    job: &ReviewJobRead,
-    selected_submission: Option<&SubmissionRead>,
-    logs: &[SubmissionLogRead],
-) -> String {
-    let mut lines = vec![
-        format!("# {}", job.title),
-        String::new(),
-        format!("- 状态：{}", job.status),
-        format!("- 解析模式：{}", review_mode_label(&job.document_parse_mode)),
-        format!("- 评分制式：{} 分", job.score_scale),
-        String::new(),
-        "## 题目".to_owned(),
-        job.question.clone(),
-        String::new(),
-    ];
-
-    if let Some(rubric) = &job.rubric {
-        lines.push("## 评分规则".to_owned());
-        lines.push(rubric.clone());
-        lines.push(String::new());
-    }
-
-    lines.push("## 提交汇总".to_owned());
-    lines.push("| 文件 | 学生 | 分数 | 执行状态 | 复核状态 | 总结 |".to_owned());
-    lines.push("| --- | --- | --- | --- | --- | --- |".to_owned());
-    for submission in &job.submissions {
-        lines.push(format!(
-            "| {} | {} | {} | {} | {} | {} |",
-            submission.original_filename,
-            submission.matched_student_name.as_deref().unwrap_or("-"),
-            submission
-                .score
-                .map(|value| format!("{value:.2}/{}", submission.score_scale))
-                .unwrap_or_else(|| "-".to_owned()),
-            submission.status,
-            submission.review_status,
-            submission.review_summary.as_deref().unwrap_or("-").replace('\n', " "),
-        ));
-    }
-    lines.push(String::new());
-
-    if let Some(submission) = selected_submission {
-        lines.push("## 当前选中提交".to_owned());
-        lines.push(format!("- 文件：{}", submission.original_filename));
-        lines.push(format!(
-            "- 学生：{}",
-            submission.matched_student_name.as_deref().unwrap_or("-")
-        ));
-        lines.push(format!(
-            "- 分数：{}",
-            submission
-                .score
-                .map(|value| format!("{value:.2}/{}", submission.score_scale))
-                .unwrap_or_else(|| "-".to_owned())
-        ));
-        lines.push(format!("- 复核状态：{}", submission.review_status));
-        if let Some(comment) = &submission.teacher_comment {
-            lines.push(format!("- 教师评语：{comment}"));
-        }
-        lines.push(String::new());
-        if !logs.is_empty() {
-            lines.push("## 当前选中提交日志".to_owned());
-            for log in logs {
-                lines.push(format!(
-                    "- [{}][{}] {}",
-                    log.created_at, log.stage, log.message
-                ));
-            }
-        }
-    }
-
-    lines.join("\n")
 }

@@ -21,6 +21,38 @@ from backend.config import get_settings
 MAX_EXTRACTED_TEXT = 120_000
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 TEXT_SUFFIXES = {".txt", ".md"}
+CODE_SUFFIXES = {
+    ".bat",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cs",
+    ".css",
+    ".go",
+    ".h",
+    ".hpp",
+    ".html",
+    ".ipynb",
+    ".java",
+    ".js",
+    ".json",
+    ".jsx",
+    ".kt",
+    ".m",
+    ".php",
+    ".py",
+    ".r",
+    ".rb",
+    ".rs",
+    ".sh",
+    ".sql",
+    ".swift",
+    ".ts",
+    ".tsx",
+    ".xml",
+    ".yaml",
+    ".yml",
+}
 PRESENTATION_SUFFIXES = {".pptx", ".pptm", ".potx", ".potm"}
 LEGACY_PRESENTATION_SUFFIXES = {".ppt"}
 
@@ -51,7 +83,7 @@ class DocumentParser:
     def parse(self, file_path: str | Path) -> ParsedDocument:
         resolved = Path(file_path).expanduser().resolve()
         suffix = resolved.suffix.lower()
-        if suffix in TEXT_SUFFIXES:
+        if suffix in TEXT_SUFFIXES | CODE_SUFFIXES:
             return self._trim(self._parse_text(resolved))
         if suffix == ".docx":
             return self._trim(self._parse_docx(resolved))
@@ -69,6 +101,7 @@ class DocumentParser:
         suffix = Path(file_path).suffix.lower()
         return suffix in (
             TEXT_SUFFIXES
+            | CODE_SUFFIXES
             | IMAGE_SUFFIXES
             | PRESENTATION_SUFFIXES
             | LEGACY_PRESENTATION_SUFFIXES

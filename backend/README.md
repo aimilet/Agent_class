@@ -174,8 +174,21 @@ export ZHUJIAO_LLM_MODEL="your-model"
 export ZHUJIAO_LLM_TEMPERATURE="0"
 export ZHUJIAO_LLM_TIMEOUT_SECONDS="120"
 export ZHUJIAO_LLM_MAX_RETRIES="2"
+export ZHUJIAO_LLM_API_MODE="responses"
 export ZHUJIAO_LLM_JSON_METHOD="json_schema"
+export ZHUJIAO_MAX_ANSWER_ROUNDS="3"
+export ZHUJIAO_SUBMISSION_UNPACK_MAX_DEPTH="4"
+export ZHUJIAO_SUBMISSION_UNPACK_MAX_FILES="120"
 ```
+
+说明：
+
+- `ZHUJIAO_LLM_API_MODE=responses` 使用 OpenAI Responses API，适合当前多模态与结构化输出链路
+- `ZHUJIAO_LLM_API_MODE=chat_completions` 可切回旧的 Chat Completions 兼容模式
+- `ZHUJIAO_MAX_ANSWER_ROUNDS` 控制评审初始化中答案生成、纠错、裁决的最大往返轮数
+- `ZHUJIAO_SUBMISSION_UNPACK_MAX_DEPTH` 控制提交压缩包、目录的最大递归展开深度
+- `ZHUJIAO_SUBMISSION_UNPACK_MAX_FILES` 控制单个提交最多纳入多少个解包文件
+- Responses 模式会优先把 Word、PDF、PPT、Excel 作为 `input_file` 原始附件传给模型，图片作为 `input_image` 传给模型；源码和纯文本文件以文本片段传入
 
 本地联调模式：
 

@@ -9,8 +9,8 @@ use eframe::egui;
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1440.0, 920.0])
-            .with_min_inner_size([960.0, 620.0])
+            .with_inner_size([1280.0, 820.0])
+            .with_min_inner_size([560.0, 380.0])
             .with_title("助教 Agent 桌面端"),
         ..Default::default()
     };

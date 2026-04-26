@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from backend.agents import AnswerCriticAgent, AnswerGeneratorAgent, AnswerJudgeAgent, ReviewMaterialParserAgent
 from backend.agents.base import AgentExecutor
+from backend.core.settings import get_settings
 from backend.domain.models import ReviewAnswerGenerationRound, ReviewPrep, ReviewQuestionItem
 from backend.graphs.common import compile_graph
 from backend.infra.observability import AuditService
@@ -35,6 +36,7 @@ class ReviewPrepGraph:
         self.answer_critic_agent = AnswerCriticAgent()
         self.answer_judge_agent = AnswerJudgeAgent()
         self.executor = AgentExecutor(session)
+        self.settings = get_settings()
         self.compiled = compile_graph(
             state_schema=ReviewPrepState,
             input_schema=ReviewPrepGraphInput,
@@ -107,11 +109,12 @@ class ReviewPrepGraph:
 
     def generate_answers(self, state: ReviewPrepState) -> ReviewPrepState:
         review_prep = self.session.scalar(select(ReviewPrep).where(ReviewPrep.public_id == state["review_prep_public_id"]))
+        max_rounds = max(1, self.settings.max_answer_rounds)
         for question in state["question_items"]:
             reference_short = None
             reference_full = None
             issues: list[str] = []
-            for round_no in range(1, 4):
+            for round_no in range(1, max_rounds + 1):
                 review_prep.status = "answer_generating"
                 self.session.flush()
                 generator_output = self.executor.run(
@@ -181,7 +184,7 @@ class ReviewPrepGraph:
                             "reference_answer_full": reference_full,
                             "issues": issues,
                             "round_no": round_no,
-                            "max_rounds": 3,
+                            "max_rounds": max_rounds,
                         },
                     ),
                     handler=self.answer_judge_agent,

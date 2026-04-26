@@ -11,9 +11,11 @@ from backend.agents.base import AgentExecutor
 from backend.core.settings import get_settings
 from backend.domain.models import AssetSelectionResult, ReviewItemResult, ReviewResult, ReviewRun, Submission
 from backend.graphs.common import compile_graph
+from backend.infra.llm import build_file_message_parts
 from backend.infra.observability import AuditService
 from backend.schemas.common import AgentInputEnvelope, AgentRunContext, AgentTaskContext
 from backend.services.document_parser import DocumentParser
+from backend.services.submission_bundle import SubmissionBundleParser
 
 
 class SubmissionReviewGraphInput(TypedDict):
@@ -40,6 +42,7 @@ class SubmissionReviewGraph:
         self.executor = AgentExecutor(session)
         self.parser = DocumentParser()
         self.settings = get_settings()
+        self.bundle_parser = SubmissionBundleParser(self.parser, self.settings)
         self.compiled = compile_graph(
             state_schema=SubmissionReviewState,
             input_schema=SubmissionReviewGraphInput,
@@ -129,12 +132,19 @@ class SubmissionReviewGraph:
         for asset in state["selected_assets"][: self.settings.vision_max_assets_per_submission]:
             if not asset.get("real_path"):
                 continue
+            if build_file_message_parts([asset], path_key="real_path", filename_key="logical_path", image_limit=1):
+                continue
             try:
                 parsed = self.parser.parse(asset["real_path"])
                 if parsed.text.strip():
                     texts.append(parsed.text.strip())
             except Exception:
-                continue
+                try:
+                    bundle = self.bundle_parser.parse_submission(asset["real_path"])
+                except Exception:
+                    continue
+                if bundle.text.strip():
+                    texts.append(bundle.text.strip())
         return {**state, "submission_text": "\n\n".join(texts)}
 
     def grade_submission(self, state: SubmissionReviewState) -> SubmissionReviewState:

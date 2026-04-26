@@ -56,6 +56,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiofiles" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "langchain-openai" },
     { name = "langgraph" },
     { name = "openpyxl" },
@@ -81,6 +82,7 @@ dev = [
 requires-dist = [
     { name = "aiofiles", specifier = ">=25.1.0" },
     { name = "fastapi", specifier = ">=0.136.0" },
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "langchain-openai", specifier = ">=1.2.0" },
     { name = "langgraph", specifier = ">=1.1.9" },
     { name = "openpyxl", specifier = ">=3.1.5" },

@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.0
     llm_timeout_seconds: float = 120.0
     llm_max_retries: int = 2
+    llm_api_mode: str = "responses"
     llm_json_method: str = "json_schema"
     mock_llm_enabled: bool = False
     mock_llm_model_name: str = "mock-structured-llm"

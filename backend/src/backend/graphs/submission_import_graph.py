@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import tarfile
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, TypedDict
@@ -8,6 +10,8 @@ from sqlalchemy.orm import Session
 
 from backend.agents import SubmissionMatchAgent
 from backend.agents.base import AgentExecutor
+from backend.core.ids import generate_public_id
+from backend.core.settings import get_settings
 from backend.db.repositories import AssignmentRepository, CourseRepository, EnrollmentRepository, SubmissionRepository
 from backend.domain.models import Assignment
 from backend.domain.state_machine import ensure_transition
@@ -15,6 +19,25 @@ from backend.graphs.common import compile_graph
 from backend.infra.observability import AuditService
 from backend.infra.storage import mime_type_for_path, sha256_for_file
 from backend.schemas.common import AgentInputEnvelope, AgentRunContext, AgentTaskContext
+
+
+ARCHIVE_SUFFIXES = {".zip", ".tar", ".tgz", ".tbz", ".tbz2", ".txz", ".gz", ".bz2", ".xz"}
+SKIPPED_ARCHIVE_PARTS = {
+    "__MACOSX",
+    ".git",
+    ".hg",
+    ".svn",
+    ".idea",
+    ".vscode",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    "node_modules",
+    "dist",
+    "build",
+    "target",
+}
+SKIPPED_ARCHIVE_FILENAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
 
 
 class SubmissionImportGraphInput(TypedDict):
@@ -40,6 +63,7 @@ class SubmissionImportGraph:
         self.audit_service = AuditService(session)
         self.agent = SubmissionMatchAgent()
         self.agent_executor = AgentExecutor(session)
+        self.settings = get_settings()
         self.compiled = compile_graph(
             state_schema=SubmissionImportState,
             input_schema=SubmissionImportGraphInput,
@@ -87,30 +111,151 @@ class SubmissionImportGraph:
         return entries
 
     def _build_asset_manifest(self, entry: Path) -> list[dict[str, Any]]:
+        counter = {"files": 0}
+        unpack_root = self.settings.artifacts_root / "submission_unpacked" / generate_public_id("unpack")
+        logical_path = entry.name if entry.is_file() else ""
+        assets = self._collect_asset_manifest(entry, logical_path=logical_path, unpack_root=unpack_root, depth=0, counter=counter)
+        if assets:
+            return assets
         if entry.is_file():
-            return [
-                {
-                    "logical_path": entry.name,
-                    "real_path": str(entry.resolve()),
-                    "file_hash": sha256_for_file(entry),
-                    "mime_type": mime_type_for_path(entry),
-                    "size_bytes": entry.stat().st_size,
-                }
-            ]
-        assets: list[dict[str, Any]] = []
-        for child in sorted(entry.rglob("*")):
-            if not child.is_file():
-                continue
-            assets.append(
-                {
-                    "logical_path": child.relative_to(entry).as_posix(),
-                    "real_path": str(child.resolve()),
-                    "file_hash": sha256_for_file(child),
-                    "mime_type": mime_type_for_path(child),
-                    "size_bytes": child.stat().st_size,
-                }
-            )
-        return assets
+            return [self._single_asset(entry, logical_path=entry.name, asset_role="archive_unexpanded" if self._is_archive(entry) else None)]
+        return []
+
+    def _collect_asset_manifest(
+        self,
+        path: Path,
+        *,
+        logical_path: str,
+        unpack_root: Path,
+        depth: int,
+        counter: dict[str, int],
+    ) -> list[dict[str, Any]]:
+        if self._should_skip_path(path):
+            return []
+        if depth > self.settings.submission_unpack_max_depth:
+            return []
+        if path.is_dir():
+            assets: list[dict[str, Any]] = []
+            for child in sorted(path.iterdir(), key=lambda item: item.name):
+                child_logical = f"{logical_path}/{child.name}" if logical_path else child.name
+                assets.extend(
+                    self._collect_asset_manifest(
+                        child,
+                        logical_path=child_logical,
+                        unpack_root=unpack_root,
+                        depth=depth + 1,
+                        counter=counter,
+                    )
+                )
+            return assets
+        if not path.is_file():
+            return []
+        if self._is_archive(path):
+            if depth >= self.settings.submission_unpack_max_depth:
+                return [self._single_asset(path, logical_path=logical_path, asset_role="archive_unexpanded")]
+            try:
+                extract_root = self._extract_archive_for_manifest(path, unpack_root)
+            except ValueError:
+                return [self._single_asset(path, logical_path=logical_path, asset_role="archive_unexpanded")]
+            assets: list[dict[str, Any]] = []
+            for child in sorted(extract_root.iterdir(), key=lambda item: item.name):
+                child_logical = f"{logical_path}/{child.name}" if logical_path else child.name
+                assets.extend(
+                    self._collect_asset_manifest(
+                        child,
+                        logical_path=child_logical,
+                        unpack_root=unpack_root,
+                        depth=depth + 1,
+                        counter=counter,
+                    )
+                )
+            return assets
+        counter["files"] += 1
+        if counter["files"] > self.settings.submission_unpack_max_files:
+            return []
+        return [self._single_asset(path, logical_path=logical_path)]
+
+    def _single_asset(self, path: Path, *, logical_path: str, asset_role: str | None = None) -> dict[str, Any]:
+        return {
+            "logical_path": logical_path,
+            "real_path": str(path.resolve()),
+            "file_hash": sha256_for_file(path),
+            "mime_type": mime_type_for_path(path),
+            "size_bytes": path.stat().st_size,
+            "asset_role": asset_role,
+        }
+
+    def _is_archive(self, path: Path) -> bool:
+        suffix = path.suffix.lower()
+        return suffix in ARCHIVE_SUFFIXES
+
+    def _should_skip_path(self, path: Path) -> bool:
+        return path.name in SKIPPED_ARCHIVE_PARTS or path.name in SKIPPED_ARCHIVE_FILENAMES or path.name.startswith(".")
+
+    def _should_skip_archive_member(self, name: str) -> bool:
+        parts = [part for part in Path(name.replace("\\", "/")).parts if part not in {"", "."}]
+        if not parts:
+            return True
+        return bool(set(parts) & SKIPPED_ARCHIVE_PARTS) or parts[-1] in SKIPPED_ARCHIVE_FILENAMES or parts[-1].startswith(".")
+
+    def _extract_archive_for_manifest(self, archive_path: Path, unpack_root: Path) -> Path:
+        extract_root = unpack_root / generate_public_id("archive")
+        extract_root.mkdir(parents=True, exist_ok=True)
+        if zipfile.is_zipfile(archive_path):
+            self._extract_zip_for_manifest(archive_path, extract_root)
+            return extract_root
+        if tarfile.is_tarfile(archive_path):
+            self._extract_tar_for_manifest(archive_path, extract_root)
+            return extract_root
+        raise ValueError(f"无法识别压缩格式：{archive_path.name}")
+
+    def _safe_extract_target(self, extract_root: Path, member_name: str) -> Path | None:
+        if self._should_skip_archive_member(member_name):
+            return None
+        root_resolved = extract_root.resolve()
+        target = (extract_root / member_name.replace("\\", "/")).resolve()
+        if root_resolved not in target.parents and target != root_resolved:
+            return None
+        return target
+
+    def _extract_zip_for_manifest(self, archive_path: Path, extract_root: Path) -> None:
+        extracted = 0
+        with zipfile.ZipFile(archive_path) as handle:
+            for member in handle.infolist():
+                target = self._safe_extract_target(extract_root, member.filename)
+                if target is None:
+                    continue
+                if member.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                extracted += 1
+                if extracted > self.settings.submission_unpack_max_files:
+                    raise ValueError(f"压缩包文件数超过上限 {self.settings.submission_unpack_max_files}。")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with handle.open(member) as source, target.open("wb") as sink:
+                    sink.write(source.read())
+
+    def _extract_tar_for_manifest(self, archive_path: Path, extract_root: Path) -> None:
+        extracted = 0
+        with tarfile.open(archive_path) as handle:
+            for member in handle.getmembers():
+                target = self._safe_extract_target(extract_root, member.name)
+                if target is None:
+                    continue
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                if not member.isfile():
+                    continue
+                extracted += 1
+                if extracted > self.settings.submission_unpack_max_files:
+                    raise ValueError(f"压缩包文件数超过上限 {self.settings.submission_unpack_max_files}。")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source = handle.extractfile(member)
+                if source is None:
+                    continue
+                with source, target.open("wb") as sink:
+                    sink.write(source.read())
 
     def scan_submission_root(self, state: SubmissionImportState) -> SubmissionImportState:
         batch = self.submission_repo.get_import_batch(state["batch_public_id"])

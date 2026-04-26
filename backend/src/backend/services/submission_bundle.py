@@ -23,6 +23,22 @@ ARCHIVE_SUFFIXES = {
     ".xz",
 }
 UNSUPPORTED_ARCHIVE_SUFFIXES = {".rar", ".7z"}
+SKIPPED_ARCHIVE_PARTS = {
+    "__MACOSX",
+    ".git",
+    ".hg",
+    ".svn",
+    ".idea",
+    ".vscode",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    "node_modules",
+    "dist",
+    "build",
+    "target",
+}
+SKIPPED_ARCHIVE_FILENAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
 
 
 @dataclass(slots=True)
@@ -131,7 +147,7 @@ class SubmissionBundleParser:
         depth: int,
         counter: dict[str, int],
     ) -> SubmissionBundle:
-        children = sorted(child for child in directory.iterdir() if not child.name.startswith("."))
+        children = sorted(child for child in directory.iterdir() if not self._should_skip_path(child))
         if not children:
             raise ValueError(f"目录为空：{logical_path}")
 
@@ -196,6 +212,8 @@ class SubmissionBundleParser:
         bundles: list[tuple[str, SubmissionBundle]] = []
         for child in sorted(extract_root.rglob("*")):
             if not child.exists() or not child.is_file():
+                continue
+            if self._should_skip_path(child):
                 continue
             relative = child.relative_to(extract_root).as_posix()
             child_logical = f"{logical_path}/{relative}"
@@ -278,6 +296,24 @@ class SubmissionBundleParser:
         suffix = path.suffix.lower()
         return suffix in ARCHIVE_SUFFIXES or zipfile.is_zipfile(path) or tarfile.is_tarfile(path)
 
+    def _should_skip_path(self, path: Path) -> bool:
+        return path.name in SKIPPED_ARCHIVE_PARTS or path.name in SKIPPED_ARCHIVE_FILENAMES or path.name.startswith(".")
+
+    def _should_skip_archive_member(self, name: str) -> bool:
+        parts = [part for part in Path(name.replace("\\", "/")).parts if part not in {"", "."}]
+        if not parts:
+            return True
+        return bool(set(parts) & SKIPPED_ARCHIVE_PARTS) or parts[-1] in SKIPPED_ARCHIVE_FILENAMES or parts[-1].startswith(".")
+
+    def _safe_extract_target(self, extract_root: Path, member_name: str) -> Path | None:
+        if self._should_skip_archive_member(member_name):
+            return None
+        root_resolved = extract_root.resolve()
+        target = (extract_root / member_name.replace("\\", "/")).resolve()
+        if root_resolved not in target.parents and target != root_resolved:
+            return None
+        return target
+
     def _extract_archive(self, archive_path: Path, extract_root: Path) -> int:
         if zipfile.is_zipfile(archive_path):
             return self._extract_zip(archive_path, extract_root)
@@ -287,39 +323,41 @@ class SubmissionBundleParser:
 
     def _extract_zip(self, archive_path: Path, extract_root: Path) -> int:
         extracted = 0
-        root_resolved = extract_root.resolve()
         with zipfile.ZipFile(archive_path) as handle:
             for member in handle.infolist():
-                target = (extract_root / member.filename).resolve()
-                if root_resolved not in target.parents and target != root_resolved:
+                target = self._safe_extract_target(extract_root, member.filename)
+                if target is None:
                     continue
                 if member.is_dir():
                     target.mkdir(parents=True, exist_ok=True)
                     continue
+                extracted += 1
+                if extracted > self.settings.submission_unpack_max_files:
+                    raise ValueError(f"压缩包文件数超过上限 {self.settings.submission_unpack_max_files}。")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with handle.open(member) as source, target.open("wb") as sink:
                     sink.write(source.read())
-                extracted += 1
         return extracted
 
     def _extract_tar(self, archive_path: Path, extract_root: Path) -> int:
         extracted = 0
-        root_resolved = extract_root.resolve()
         with tarfile.open(archive_path) as handle:
             for member in handle.getmembers():
-                target = (extract_root / member.name).resolve()
-                if root_resolved not in target.parents and target != root_resolved:
+                target = self._safe_extract_target(extract_root, member.name)
+                if target is None:
                     continue
                 if member.isdir():
                     target.mkdir(parents=True, exist_ok=True)
                     continue
                 if not member.isfile():
                     continue
+                extracted += 1
+                if extracted > self.settings.submission_unpack_max_files:
+                    raise ValueError(f"压缩包文件数超过上限 {self.settings.submission_unpack_max_files}。")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 source = handle.extractfile(member)
                 if source is None:
                     continue
                 with source, target.open("wb") as sink:
                     sink.write(source.read())
-                extracted += 1
         return extracted
