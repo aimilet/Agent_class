@@ -169,7 +169,7 @@ class NamingService:
             object_public_id=plan.public_id,
             action_type="execute",
             title="批量命名修正审批",
-            summary=f"共 {len(plan.operations)} 条命名修正操作等待审批。",
+            summary=f"共 {len(plan.operations)} 条命名修正操作将作为一个审批任务统一审批与执行。",
             command_preview_json=command_preview,
         )
         for operation in plan.operations:

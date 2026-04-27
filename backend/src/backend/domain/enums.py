@@ -57,6 +57,7 @@ class SubmissionImportBatchStatus(StrEnum):
     CONFIRMED = "confirmed"
     APPLIED = "applied"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class SubmissionStatus(StrEnum):
@@ -115,6 +116,7 @@ class ReviewPrepStatus(StrEnum):
     CONFIRMED = "confirmed"
     READY = "ready"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class ReviewQuestionItemStatus(StrEnum):

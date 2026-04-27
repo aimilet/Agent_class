@@ -10,7 +10,9 @@ from sqlalchemy.orm import Session
 
 from backend.agents import SubmissionMatchAgent
 from backend.agents.base import AgentExecutor
+from backend.core.background_jobs import get_background_job_registry
 from backend.core.ids import generate_public_id
+from backend.core.pathing import resolve_user_path
 from backend.core.settings import get_settings
 from backend.db.repositories import AssignmentRepository, CourseRepository, EnrollmentRepository, SubmissionRepository
 from backend.domain.models import Assignment
@@ -64,6 +66,7 @@ class SubmissionImportGraph:
         self.agent = SubmissionMatchAgent()
         self.agent_executor = AgentExecutor(session)
         self.settings = get_settings()
+        self.job_registry = get_background_job_registry()
         self.compiled = compile_graph(
             state_schema=SubmissionImportState,
             input_schema=SubmissionImportGraphInput,
@@ -95,9 +98,13 @@ class SubmissionImportGraph:
             fallback_state = node(fallback_state)
         return fallback_state
 
-    def _list_root_entries(self, assignment: Assignment, root_path: Path) -> list[dict[str, Any]]:
+    def _raise_if_cancel_requested(self, batch_public_id: str) -> None:
+        self.job_registry.raise_if_cancel_requested("submission_import_batch", batch_public_id)
+
+    def _list_root_entries(self, assignment: Assignment, root_path: Path, *, batch_public_id: str) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
         for child in sorted(root_path.iterdir(), key=lambda item: item.name):
+            self._raise_if_cancel_requested(batch_public_id)
             if child.name.startswith("."):
                 continue
             entries.append(
@@ -105,16 +112,23 @@ class SubmissionImportGraph:
                     "assignment_public_id": assignment.public_id,
                     "source_entry_name": child.name,
                     "source_entry_path": str(child.resolve()),
-                    "assets": self._build_asset_manifest(child),
+                    "assets": self._build_asset_manifest(child, batch_public_id=batch_public_id),
                 }
             )
         return entries
 
-    def _build_asset_manifest(self, entry: Path) -> list[dict[str, Any]]:
+    def _build_asset_manifest(self, entry: Path, *, batch_public_id: str) -> list[dict[str, Any]]:
         counter = {"files": 0}
         unpack_root = self.settings.artifacts_root / "submission_unpacked" / generate_public_id("unpack")
         logical_path = entry.name if entry.is_file() else ""
-        assets = self._collect_asset_manifest(entry, logical_path=logical_path, unpack_root=unpack_root, depth=0, counter=counter)
+        assets = self._collect_asset_manifest(
+            entry,
+            logical_path=logical_path,
+            unpack_root=unpack_root,
+            depth=0,
+            counter=counter,
+            batch_public_id=batch_public_id,
+        )
         if assets:
             return assets
         if entry.is_file():
@@ -129,7 +143,9 @@ class SubmissionImportGraph:
         unpack_root: Path,
         depth: int,
         counter: dict[str, int],
+        batch_public_id: str,
     ) -> list[dict[str, Any]]:
+        self._raise_if_cancel_requested(batch_public_id)
         if self._should_skip_path(path):
             return []
         if depth > self.settings.submission_unpack_max_depth:
@@ -137,6 +153,7 @@ class SubmissionImportGraph:
         if path.is_dir():
             assets: list[dict[str, Any]] = []
             for child in sorted(path.iterdir(), key=lambda item: item.name):
+                self._raise_if_cancel_requested(batch_public_id)
                 child_logical = f"{logical_path}/{child.name}" if logical_path else child.name
                 assets.extend(
                     self._collect_asset_manifest(
@@ -145,6 +162,7 @@ class SubmissionImportGraph:
                         unpack_root=unpack_root,
                         depth=depth + 1,
                         counter=counter,
+                        batch_public_id=batch_public_id,
                     )
                 )
             return assets
@@ -154,11 +172,12 @@ class SubmissionImportGraph:
             if depth >= self.settings.submission_unpack_max_depth:
                 return [self._single_asset(path, logical_path=logical_path, asset_role="archive_unexpanded")]
             try:
-                extract_root = self._extract_archive_for_manifest(path, unpack_root)
+                extract_root = self._extract_archive_for_manifest(path, unpack_root, batch_public_id=batch_public_id)
             except ValueError:
                 return [self._single_asset(path, logical_path=logical_path, asset_role="archive_unexpanded")]
             assets: list[dict[str, Any]] = []
             for child in sorted(extract_root.iterdir(), key=lambda item: item.name):
+                self._raise_if_cancel_requested(batch_public_id)
                 child_logical = f"{logical_path}/{child.name}" if logical_path else child.name
                 assets.extend(
                     self._collect_asset_manifest(
@@ -167,6 +186,7 @@ class SubmissionImportGraph:
                         unpack_root=unpack_root,
                         depth=depth + 1,
                         counter=counter,
+                        batch_public_id=batch_public_id,
                     )
                 )
             return assets
@@ -198,14 +218,15 @@ class SubmissionImportGraph:
             return True
         return bool(set(parts) & SKIPPED_ARCHIVE_PARTS) or parts[-1] in SKIPPED_ARCHIVE_FILENAMES or parts[-1].startswith(".")
 
-    def _extract_archive_for_manifest(self, archive_path: Path, unpack_root: Path) -> Path:
+    def _extract_archive_for_manifest(self, archive_path: Path, unpack_root: Path, *, batch_public_id: str) -> Path:
+        self._raise_if_cancel_requested(batch_public_id)
         extract_root = unpack_root / generate_public_id("archive")
         extract_root.mkdir(parents=True, exist_ok=True)
         if zipfile.is_zipfile(archive_path):
-            self._extract_zip_for_manifest(archive_path, extract_root)
+            self._extract_zip_for_manifest(archive_path, extract_root, batch_public_id=batch_public_id)
             return extract_root
         if tarfile.is_tarfile(archive_path):
-            self._extract_tar_for_manifest(archive_path, extract_root)
+            self._extract_tar_for_manifest(archive_path, extract_root, batch_public_id=batch_public_id)
             return extract_root
         raise ValueError(f"无法识别压缩格式：{archive_path.name}")
 
@@ -218,10 +239,11 @@ class SubmissionImportGraph:
             return None
         return target
 
-    def _extract_zip_for_manifest(self, archive_path: Path, extract_root: Path) -> None:
+    def _extract_zip_for_manifest(self, archive_path: Path, extract_root: Path, *, batch_public_id: str) -> None:
         extracted = 0
         with zipfile.ZipFile(archive_path) as handle:
             for member in handle.infolist():
+                self._raise_if_cancel_requested(batch_public_id)
                 target = self._safe_extract_target(extract_root, member.filename)
                 if target is None:
                     continue
@@ -235,10 +257,11 @@ class SubmissionImportGraph:
                 with handle.open(member) as source, target.open("wb") as sink:
                     sink.write(source.read())
 
-    def _extract_tar_for_manifest(self, archive_path: Path, extract_root: Path) -> None:
+    def _extract_tar_for_manifest(self, archive_path: Path, extract_root: Path, *, batch_public_id: str) -> None:
         extracted = 0
         with tarfile.open(archive_path) as handle:
             for member in handle.getmembers():
+                self._raise_if_cancel_requested(batch_public_id)
                 target = self._safe_extract_target(extract_root, member.name)
                 if target is None:
                     continue
@@ -258,18 +281,20 @@ class SubmissionImportGraph:
                     sink.write(source.read())
 
     def scan_submission_root(self, state: SubmissionImportState) -> SubmissionImportState:
+        self._raise_if_cancel_requested(state["batch_public_id"])
         batch = self.submission_repo.get_import_batch(state["batch_public_id"])
         assignment = self.assignment_repo.get_by_public_id(state["assignment_public_id"])
         ensure_transition("submission_import_batch", batch.status, "scanning")
         batch.status = "scanning"
         self.session.flush()
-        root_path = Path(batch.root_path).expanduser().resolve()
+        root_path = resolve_user_path(batch.root_path, settings=self.settings)
+        batch.root_path = str(root_path)
         if not root_path.exists() or not root_path.is_dir():
             batch.status = "failed"
             batch.error_message = "作业根目录不存在，或不是目录。"
             self.session.flush()
             raise ValueError(batch.error_message)
-        entry_manifest = self._list_root_entries(assignment, root_path)
+        entry_manifest = self._list_root_entries(assignment, root_path, batch_public_id=batch.public_id)
         course = assignment.course
         enrollments = [
             {
@@ -282,6 +307,7 @@ class SubmissionImportGraph:
         return {**state, "entry_manifest": entry_manifest, "enrollments": enrollments}
 
     def run_match_agent(self, state: SubmissionImportState) -> SubmissionImportState:
+        self._raise_if_cancel_requested(state["batch_public_id"])
         batch = self.submission_repo.get_import_batch(state["batch_public_id"])
         batch.status = "matching"
         self.session.flush()
@@ -345,6 +371,7 @@ class SubmissionImportGraph:
         return {**state, "submissions": submissions, "review_required": result.output.needs_review}
 
     def persist_submissions(self, state: SubmissionImportState) -> SubmissionImportState:
+        self._raise_if_cancel_requested(state["batch_public_id"])
         batch = self.submission_repo.get_import_batch(state["batch_public_id"])
         created = self.submission_repo.replace_submissions(batch, state["submissions"])
         batch.summary_json = {
@@ -356,6 +383,7 @@ class SubmissionImportGraph:
         return {**state}
 
     def finalize_batch(self, state: SubmissionImportState) -> SubmissionImportState:
+        self._raise_if_cancel_requested(state["batch_public_id"])
         batch = self.submission_repo.get_import_batch(state["batch_public_id"])
         assignment = self.assignment_repo.get_by_public_id(state["assignment_public_id"])
         if batch.status == "confirmed":

@@ -22,6 +22,8 @@ class ApprovalService:
 
     def approve(self, *, approval_task_public_id: str, operator_note: str | None, operator_id: str = "system"):
         task = self.approval_repo.get_task(approval_task_public_id)
+        if task.status == "approved":
+            return task
         if task.status != "pending":
             raise DomainError("审批任务当前不可批准。", code="approval_task_invalid_status", status_code=409)
         task.status = "approved"
@@ -45,6 +47,8 @@ class ApprovalService:
 
     def reject(self, *, approval_task_public_id: str, operator_note: str | None, operator_id: str = "system"):
         task = self.approval_repo.get_task(approval_task_public_id)
+        if task.status == "rejected":
+            return task
         if task.status != "pending":
             raise DomainError("审批任务当前不可拒绝。", code="approval_task_invalid_status", status_code=409)
         task.status = "rejected"

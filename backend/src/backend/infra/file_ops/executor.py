@@ -26,7 +26,9 @@ def execute_rename(source_path: str | Path, target_path: str | Path) -> RenameEx
     target = Path(target_path).expanduser().resolve()
     if not source.exists():
         return RenameExecutionResult(str(source), str(target), executed=False, reason="源文件不存在")
-    if not is_within_allowed_roots(source) or not is_within_allowed_roots(target.parent):
+    in_allowed_roots = is_within_allowed_roots(source) and is_within_allowed_roots(target.parent)
+    same_directory_rename = source.parent == target.parent
+    if not in_allowed_roots and not same_directory_rename:
         raise DomainError(
             "重命名目标超出受控根目录。",
             code="rename_out_of_scope",

@@ -8,6 +8,8 @@ from sqlalchemy.orm import Session
 
 from backend.agents import AssetSelectorAgent, GradingAgent, GradingValidatorAgent
 from backend.agents.base import AgentExecutor
+from backend.core.background_jobs import BackgroundJobCancelled, get_background_job_registry
+from backend.core.runtime_review_settings import RuntimeReviewSettingsStore
 from backend.core.settings import get_settings
 from backend.domain.models import AssetSelectionResult, ReviewItemResult, ReviewResult, ReviewRun, Submission
 from backend.graphs.common import compile_graph
@@ -42,7 +44,9 @@ class SubmissionReviewGraph:
         self.executor = AgentExecutor(session)
         self.parser = DocumentParser()
         self.settings = get_settings()
+        self.runtime_settings_store = RuntimeReviewSettingsStore(self.settings)
         self.bundle_parser = SubmissionBundleParser(self.parser, self.settings)
+        self.job_registry = get_background_job_registry()
         self.compiled = compile_graph(
             state_schema=SubmissionReviewState,
             input_schema=SubmissionReviewGraphInput,
@@ -67,14 +71,27 @@ class SubmissionReviewGraph:
             "submission_public_id": submission_public_id,
             "operator_id": operator_id,
         }
-        if self.compiled is not None:
-            return self.compiled.invoke(state)
-        fallback_state: SubmissionReviewState = dict(state)
-        for node in (self.select_assets, self.parse_assets, self.grade_submission, self.persist_result):
-            fallback_state = node(fallback_state)
-        return fallback_state
+        try:
+            if self.compiled is not None:
+                return self.compiled.invoke(state)
+            fallback_state: SubmissionReviewState = dict(state)
+            for node in (self.select_assets, self.parse_assets, self.grade_submission, self.persist_result):
+                fallback_state = node(fallback_state)
+            return fallback_state
+        except BackgroundJobCancelled:
+            raise
+        except Exception as exc:
+            return self.mark_submission_for_manual_review(
+                state=state,
+                error_message=f"{type(exc).__name__}: {exc}",
+                reason="submission_review_graph_failed",
+            )
+
+    def _raise_if_cancel_requested(self, review_run_public_id: str) -> None:
+        self.job_registry.raise_if_cancel_requested("review_run", review_run_public_id)
 
     def select_assets(self, state: SubmissionReviewState) -> SubmissionReviewState:
+        self._raise_if_cancel_requested(state["review_run_public_id"])
         review_run = self.session.scalar(select(ReviewRun).where(ReviewRun.public_id == state["review_run_public_id"]))
         submission = self.session.scalar(select(Submission).where(Submission.public_id == state["submission_public_id"]))
         review_run.status = "selecting_assets"
@@ -130,6 +147,7 @@ class SubmissionReviewGraph:
     def parse_assets(self, state: SubmissionReviewState) -> SubmissionReviewState:
         texts: list[str] = []
         for asset in state["selected_assets"][: self.settings.vision_max_assets_per_submission]:
+            self._raise_if_cancel_requested(state["review_run_public_id"])
             if not asset.get("real_path"):
                 continue
             if build_file_message_parts([asset], path_key="real_path", filename_key="logical_path", image_limit=1):
@@ -148,8 +166,10 @@ class SubmissionReviewGraph:
         return {**state, "submission_text": "\n\n".join(texts)}
 
     def grade_submission(self, state: SubmissionReviewState) -> SubmissionReviewState:
+        self._raise_if_cancel_requested(state["review_run_public_id"])
         review_run = self.session.scalar(select(ReviewRun).where(ReviewRun.public_id == state["review_run_public_id"]))
         submission = self.session.scalar(select(Submission).where(Submission.public_id == state["submission_public_id"]))
+        runtime_settings = self.runtime_settings_store.load()
         review_run.status = "grading"
         self.session.flush()
         reference_text = "\n\n".join(
@@ -183,38 +203,138 @@ class SubmissionReviewGraph:
             ),
             handler=self.grading_agent,
         ).output
-        validation_output = self.executor.run(
-            graph_name="submission_review_graph",
-            stage_name="grading_validator_agent",
-            agent_name=self.validator_agent.name,
-            prompt_version=self.validator_agent.prompt_version,
-            model_name=self.validator_agent.model_name,
-            envelope=AgentInputEnvelope(
-                run_context=AgentRunContext(
-                    graph_name="submission_review_graph",
-                    stage_name="grading_validator_agent",
-                    run_id=f"submission_review:{review_run.public_id}:{submission.public_id}:validator",
-                    assignment_id=review_run.assignment.public_id,
-                    review_prep_id=review_run.review_prep.public_id,
-                    submission_id=submission.public_id,
-                    prompt_version=self.validator_agent.prompt_version,
-                    model_name=self.validator_agent.model_name,
+        self._raise_if_cancel_requested(state["review_run_public_id"])
+        if runtime_settings.review_run_enable_validation_agent:
+            validation_output = self.executor.run(
+                graph_name="submission_review_graph",
+                stage_name="grading_validator_agent",
+                agent_name=self.validator_agent.name,
+                prompt_version=self.validator_agent.prompt_version,
+                model_name=self.validator_agent.model_name,
+                envelope=AgentInputEnvelope(
+                    run_context=AgentRunContext(
+                        graph_name="submission_review_graph",
+                        stage_name="grading_validator_agent",
+                        run_id=f"submission_review:{review_run.public_id}:{submission.public_id}:validator",
+                        assignment_id=review_run.assignment.public_id,
+                        review_prep_id=review_run.review_prep.public_id,
+                        submission_id=submission.public_id,
+                        prompt_version=self.validator_agent.prompt_version,
+                        model_name=self.validator_agent.model_name,
+                    ),
+                    task_context=AgentTaskContext(now=datetime.now(), operator_id=state["operator_id"]),
+                    payload={
+                        **grading_output.structured_output,
+                        "confidence": grading_output.confidence,
+                    },
                 ),
-                task_context=AgentTaskContext(now=datetime.now(), operator_id=state["operator_id"]),
-                payload={
-                    **grading_output.structured_output,
-                    "confidence": grading_output.confidence,
-                },
-            ),
-            handler=self.validator_agent,
-        ).output
+                handler=self.validator_agent,
+            ).output
+            validation_structured_output = validation_output.structured_output
+        else:
+            validation_structured_output = {
+                "status": "validated",
+                "errors": [],
+                "validation_skipped": True,
+            }
         return {
             **state,
             "grading_output": grading_output.structured_output,
-            "validation_output": validation_output.structured_output,
+            "validation_output": validation_structured_output,
+        }
+
+    def mark_submission_for_manual_review(
+        self,
+        *,
+        state: SubmissionReviewGraphInput | SubmissionReviewState,
+        error_message: str,
+        reason: str,
+    ) -> SubmissionReviewState:
+        review_run = self.session.scalar(select(ReviewRun).where(ReviewRun.public_id == state["review_run_public_id"]))
+        submission = self.session.scalar(select(Submission).where(Submission.public_id == state["submission_public_id"]))
+        if review_run is None or submission is None:
+            raise ValueError("评审运行或作业提交不存在，无法写入人工复核结果。")
+        selected_assets = state.get("selected_assets", [])
+        summary = f"评审输出异常，已转人工复核：{error_message}"
+        grading_output = {
+            "total_score": 0.0,
+            "score_scale": self.settings.default_review_scale,
+            "summary": summary,
+            "decision": "needs_manual_review",
+            "confidence": 0.0,
+            "item_results": [],
+            "fallback_reason": reason,
+            "error_message": error_message,
+        }
+        validation_output = {
+            "status": "needs_manual_review",
+            "errors": [error_message],
+        }
+        result = self.session.scalar(
+            select(ReviewResult).where(
+                ReviewResult.review_run_id == review_run.id,
+                ReviewResult.submission_id == submission.id,
+            )
+        )
+        if result is None:
+            result = ReviewResult(
+                public_id=ReviewResult.build_public_id(),
+                review_run_id=review_run.id,
+                submission_id=submission.id,
+            )
+            self.session.add(result)
+            self.session.flush()
+        result.total_score = grading_output["total_score"]
+        result.score_scale = grading_output["score_scale"]
+        result.summary = grading_output["summary"]
+        result.decision = grading_output["decision"]
+        result.confidence = grading_output["confidence"]
+        result.status = "needs_manual_review"
+        result.result_json = grading_output
+        evidence_json = {
+            "selected_assets": [asset["logical_path"] for asset in selected_assets if asset.get("logical_path")],
+            "fallback_reason": reason,
+            "error_message": error_message,
+        }
+        if result.item_results:
+            for item_result in result.item_results:
+                item_result.score = 0.0
+                item_result.reason = summary
+                item_result.evidence_json = evidence_json
+        else:
+            for item in review_run.review_prep.question_items:
+                self.session.add(
+                    ReviewItemResult(
+                        public_id=ReviewItemResult.build_public_id(),
+                        review_result_id=result.id,
+                        question_item_id=item.id,
+                        score=0.0,
+                        reason=summary,
+                        evidence_json=evidence_json,
+                    )
+                )
+        review_run.status = "validating"
+        submission.status = "review_ready"
+        self.audit_service.record(
+            event_type="submission_review_degraded_to_manual_review",
+            object_type="submission",
+            object_public_id=submission.public_id,
+            payload={
+                "review_run_public_id": review_run.public_id,
+                "review_result_public_id": result.public_id,
+                "reason": reason,
+                "error_message": error_message,
+            },
+        )
+        self.session.flush()
+        return {
+            **state,
+            "grading_output": grading_output,
+            "validation_output": validation_output,
         }
 
     def persist_result(self, state: SubmissionReviewState) -> SubmissionReviewState:
+        self._raise_if_cancel_requested(state["review_run_public_id"])
         review_run = self.session.scalar(select(ReviewRun).where(ReviewRun.public_id == state["review_run_public_id"]))
         submission = self.session.scalar(select(Submission).where(Submission.public_id == state["submission_public_id"]))
         review_run.status = "validating"

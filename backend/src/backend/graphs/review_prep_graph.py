@@ -8,6 +8,8 @@ from sqlalchemy.orm import Session
 
 from backend.agents import AnswerCriticAgent, AnswerGeneratorAgent, AnswerJudgeAgent, ReviewMaterialParserAgent
 from backend.agents.base import AgentExecutor
+from backend.core.background_jobs import get_background_job_registry
+from backend.core.runtime_review_settings import RuntimeReviewSettingsStore
 from backend.core.settings import get_settings
 from backend.domain.models import ReviewAnswerGenerationRound, ReviewPrep, ReviewQuestionItem
 from backend.graphs.common import compile_graph
@@ -37,6 +39,8 @@ class ReviewPrepGraph:
         self.answer_judge_agent = AnswerJudgeAgent()
         self.executor = AgentExecutor(session)
         self.settings = get_settings()
+        self.runtime_settings_store = RuntimeReviewSettingsStore(self.settings)
+        self.job_registry = get_background_job_registry()
         self.compiled = compile_graph(
             state_schema=ReviewPrepState,
             input_schema=ReviewPrepGraphInput,
@@ -71,7 +75,11 @@ class ReviewPrepGraph:
             fallback_state = node(fallback_state)
         return fallback_state
 
+    def _raise_if_cancel_requested(self, review_prep_public_id: str) -> None:
+        self.job_registry.raise_if_cancel_requested("review_prep", review_prep_public_id)
+
     def parse_materials(self, state: ReviewPrepState) -> ReviewPrepState:
+        self._raise_if_cancel_requested(state["review_prep_public_id"])
         review_prep = self.session.scalar(select(ReviewPrep).where(ReviewPrep.public_id == state["review_prep_public_id"]))
         review_prep.status = "material_parsing"
         self.session.flush()
@@ -108,13 +116,22 @@ class ReviewPrepGraph:
         }
 
     def generate_answers(self, state: ReviewPrepState) -> ReviewPrepState:
+        self._raise_if_cancel_requested(state["review_prep_public_id"])
         review_prep = self.session.scalar(select(ReviewPrep).where(ReviewPrep.public_id == state["review_prep_public_id"]))
-        max_rounds = max(1, self.settings.max_answer_rounds)
+        runtime_settings = self.runtime_settings_store.load()
+        max_rounds = runtime_settings.review_prep_max_answer_rounds
         for question in state["question_items"]:
-            reference_short = None
-            reference_full = None
+            self._raise_if_cancel_requested(state["review_prep_public_id"])
+            reference_short = question.get("reference_answer_short")
+            reference_full = question.get("reference_answer_full")
             issues: list[str] = []
+            if reference_short and reference_full:
+                question["reference_answer_short"] = reference_short
+                question["reference_answer_full"] = reference_full
+                question["rubric_text"] = question.get("rubric_text") or "参考答案要点完整、结构清晰、结论正确。"
+                continue
             for round_no in range(1, max_rounds + 1):
+                self._raise_if_cancel_requested(state["review_prep_public_id"])
                 review_prep.status = "answer_generating"
                 self.session.flush()
                 generator_output = self.executor.run(
@@ -140,6 +157,9 @@ class ReviewPrepGraph:
                 ).output
                 reference_short = generator_output.structured_output["reference_answer_short"]
                 reference_full = generator_output.structured_output["reference_answer_full"]
+                self._raise_if_cancel_requested(state["review_prep_public_id"])
+                review_prep.status = "answer_critiquing"
+                self.session.flush()
                 critic_output = self.executor.run(
                     graph_name="review_prep_graph",
                     stage_name="answer_critic_agent",
@@ -162,6 +182,7 @@ class ReviewPrepGraph:
                     handler=self.answer_critic_agent,
                 ).output
                 issues = critic_output.structured_output.get("issues", [])
+                self._raise_if_cancel_requested(state["review_prep_public_id"])
                 judge_output = self.executor.run(
                     graph_name="review_prep_graph",
                     stage_name="answer_judge_agent",
@@ -205,13 +226,16 @@ class ReviewPrepGraph:
                     break
             question["reference_answer_short"] = reference_short
             question["reference_answer_full"] = reference_full
-            question["rubric_text"] = "参考答案要点完整、结构清晰、结论正确。"
+            question["rubric_text"] = question.get("rubric_text") or "参考答案要点完整、结构清晰、结论正确。"
             if issues:
                 state["needs_review"] = True
         return {**state}
 
     def persist_review_prep(self, state: ReviewPrepState) -> ReviewPrepState:
+        self._raise_if_cancel_requested(state["review_prep_public_id"])
         review_prep = self.session.scalar(select(ReviewPrep).where(ReviewPrep.public_id == state["review_prep_public_id"]))
+        review_prep.status = "rubric_generating"
+        self.session.flush()
         self.session.execute(delete(ReviewAnswerGenerationRound).where(ReviewAnswerGenerationRound.review_prep_id == review_prep.id))
         self.session.execute(delete(ReviewQuestionItem).where(ReviewQuestionItem.review_prep_id == review_prep.id))
         self.session.flush()

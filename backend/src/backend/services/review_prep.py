@@ -6,7 +6,9 @@ from fastapi import UploadFile
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from backend.core.background_jobs import BackgroundJobCancelled, get_background_job_registry
 from backend.core.errors import DomainError
+from backend.db.session import SessionLocal
 from backend.db.repositories import AssignmentRepository
 from backend.domain.models import ReviewPrep, ReviewQuestionItem
 from backend.graphs.review_prep_graph import ReviewPrepGraph
@@ -19,6 +21,7 @@ class ReviewPrepService:
         self.session = session
         self.assignment_repo = AssignmentRepository(session)
         self.audit_service = AuditService(session)
+        self.job_registry = get_background_job_registry()
 
     async def create_review_prep(self, *, assignment_public_id: str, files: list[UploadFile]) -> ReviewPrep:
         assignment = self.assignment_repo.get_by_public_id(assignment_public_id)
@@ -61,8 +64,36 @@ class ReviewPrepService:
         review_prep = self.session.scalar(select(ReviewPrep).where(ReviewPrep.public_id == review_prep_public_id))
         if review_prep is None:
             raise DomainError("评审初始化不存在。", code="review_prep_not_found", status_code=404)
-        graph = ReviewPrepGraph(self.session)
-        graph.invoke(review_prep_public_id=review_prep.public_id, operator_id=operator_id)
+        if self.job_registry.is_active("review_prep", review_prep.public_id):
+            raise DomainError("评审初始化 Agent 已在运行中。", code="review_prep_running", status_code=409)
+        review_prep.status = "material_parsing"
+        self.audit_service.record(
+            event_type="review_prep_run_requested",
+            object_type="review_prep",
+            object_public_id=review_prep.public_id,
+            actor_type="user",
+            actor_id=operator_id,
+        )
+        self.session.commit()
+        self.job_registry.start(
+            object_type="review_prep",
+            object_public_id=review_prep.public_id,
+            label="评审初始化 Agent",
+            target=lambda: self._run_review_prep_in_background(review_prep.public_id, operator_id),
+        )
+        return review_prep
+
+    def cancel_review_prep(self, *, review_prep_public_id: str, operator_id: str = "system") -> ReviewPrep:
+        review_prep = self.get_review_prep(review_prep_public_id)
+        if not self.job_registry.request_cancel("review_prep", review_prep.public_id):
+            raise DomainError("当前没有可停止的评审初始化任务。", code="review_prep_not_running", status_code=409)
+        self.audit_service.record(
+            event_type="review_prep_cancel_requested",
+            object_type="review_prep",
+            object_public_id=review_prep.public_id,
+            actor_type="user",
+            actor_id=operator_id,
+        )
         self.session.commit()
         return review_prep
 
@@ -114,3 +145,53 @@ class ReviewPrepService:
         )
         self.session.commit()
         return review_prep
+
+    def _run_review_prep_in_background(self, review_prep_public_id: str, operator_id: str) -> None:
+        session = SessionLocal()
+        try:
+            service = ReviewPrepService(session)
+            service._execute_review_prep(review_prep_public_id=review_prep_public_id, operator_id=operator_id)
+        finally:
+            session.close()
+
+    def _execute_review_prep(self, *, review_prep_public_id: str, operator_id: str) -> None:
+        review_prep = self.get_review_prep(review_prep_public_id)
+        try:
+            graph = ReviewPrepGraph(self.session)
+            graph.invoke(review_prep_public_id=review_prep.public_id, operator_id=operator_id)
+            self.session.commit()
+        except BackgroundJobCancelled:
+            self.session.rollback()
+            self._mark_review_prep_cancelled(review_prep_public_id=review_prep_public_id, operator_id=operator_id)
+        except Exception as exc:
+            self.session.rollback()
+            self._mark_review_prep_failed(
+                review_prep_public_id=review_prep_public_id,
+                operator_id=operator_id,
+                error_message=str(exc),
+            )
+
+    def _mark_review_prep_cancelled(self, *, review_prep_public_id: str, operator_id: str) -> None:
+        review_prep = self.get_review_prep(review_prep_public_id)
+        review_prep.status = "cancelled"
+        self.audit_service.record(
+            event_type="review_prep_cancelled",
+            object_type="review_prep",
+            object_public_id=review_prep.public_id,
+            actor_type="user",
+            actor_id=operator_id,
+        )
+        self.session.commit()
+
+    def _mark_review_prep_failed(self, *, review_prep_public_id: str, operator_id: str, error_message: str) -> None:
+        review_prep = self.get_review_prep(review_prep_public_id)
+        review_prep.status = "failed"
+        self.audit_service.record(
+            event_type="review_prep_failed",
+            object_type="review_prep",
+            object_public_id=review_prep.public_id,
+            actor_type="user",
+            actor_id=operator_id,
+            payload={"error_message": error_message},
+        )
+        self.session.commit()

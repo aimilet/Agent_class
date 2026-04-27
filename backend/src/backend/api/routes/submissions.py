@@ -34,6 +34,12 @@ def run_submission_import(batch_public_id: str, session: Session = Depends(get_d
     return submission_import_batch_read(service.run_import_batch(batch_public_id=batch_public_id))
 
 
+@router.post("/submission-imports/{batch_public_id}/cancel", response_model=SubmissionImportBatchRead)
+def cancel_submission_import(batch_public_id: str, session: Session = Depends(get_db)) -> SubmissionImportBatchRead:
+    service = SubmissionService(session)
+    return submission_import_batch_read(service.cancel_import_batch(batch_public_id=batch_public_id))
+
+
 @router.get("/submission-imports/{batch_public_id}", response_model=SubmissionImportBatchRead)
 def get_submission_import(batch_public_id: str, session: Session = Depends(get_db)) -> SubmissionImportBatchRead:
     service = SubmissionService(session)

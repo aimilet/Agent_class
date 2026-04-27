@@ -29,6 +29,12 @@ def run_review_prep(review_prep_public_id: str, session: Session = Depends(get_d
     return review_prep_read(service.run_review_prep(review_prep_public_id=review_prep_public_id))
 
 
+@router.post("/review-preps/{review_prep_public_id}/cancel", response_model=ReviewPrepRead)
+def cancel_review_prep(review_prep_public_id: str, session: Session = Depends(get_db)) -> ReviewPrepRead:
+    service = ReviewPrepService(session)
+    return review_prep_read(service.cancel_review_prep(review_prep_public_id=review_prep_public_id))
+
+
 @router.get("/review-preps/{review_prep_public_id}", response_model=ReviewPrepRead)
 def get_review_prep(review_prep_public_id: str, session: Session = Depends(get_db)) -> ReviewPrepRead:
     service = ReviewPrepService(session)

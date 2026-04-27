@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     mock_llm_model_name: str = "mock-structured-llm"
     default_review_scale: int = 100
     max_answer_rounds: int = 3
+    review_validation_enabled: bool = True
     max_agent_retries: int = 2
     review_parallelism: int = 4
     submission_unpack_max_depth: int = 4

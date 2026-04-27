@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+args=()
+skip_next=0
+for arg in "$@"; do
+  if [ "$skip_next" -eq 1 ]; then
+    skip_next=0
+    continue
+  fi
+  if [ "$arg" = "-flavor" ]; then
+    skip_next=1
+    continue
+  fi
+  args+=("$arg")
+done
+exec /home/sy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/bin/gcc-ld/lld-link "${args[@]}"

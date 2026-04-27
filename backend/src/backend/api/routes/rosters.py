@@ -30,6 +30,12 @@ def run_roster_import(batch_public_id: str, session: Session = Depends(get_db)) 
     return roster_batch_read(service.run_batch(batch_public_id=batch_public_id))
 
 
+@router.post("/roster-imports/{batch_public_id}/cancel", response_model=RosterImportBatchRead)
+def cancel_roster_import(batch_public_id: str, session: Session = Depends(get_db)) -> RosterImportBatchRead:
+    service = RosterService(session)
+    return roster_batch_read(service.cancel_batch(batch_public_id=batch_public_id))
+
+
 @router.get("/roster-imports/{batch_public_id}", response_model=RosterImportBatchRead)
 def get_roster_import(batch_public_id: str, session: Session = Depends(get_db)) -> RosterImportBatchRead:
     service = RosterService(session)

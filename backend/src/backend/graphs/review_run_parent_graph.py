@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from backend.core.background_jobs import BackgroundJobCancelled, get_background_job_registry
 from backend.domain.models import ReviewRun, Submission
 from backend.graphs.common import compile_graph
 from backend.graphs.submission_review_graph import SubmissionReviewGraph
@@ -27,6 +28,7 @@ class ReviewRunParentGraph:
         self.session = session
         self.audit_service = AuditService(session)
         self.child_graph = SubmissionReviewGraph(session)
+        self.job_registry = get_background_job_registry()
         self.compiled = compile_graph(
             state_schema=ReviewRunParentState,
             input_schema=ReviewRunParentGraphInput,
@@ -59,10 +61,12 @@ class ReviewRunParentGraph:
             fallback_state = node(fallback_state)
         return fallback_state
 
+    def _raise_if_cancel_requested(self, review_run_public_id: str) -> None:
+        self.job_registry.raise_if_cancel_requested("review_run", review_run_public_id)
+
     def load_submission_scope(self, state: ReviewRunParentState) -> ReviewRunParentState:
+        self._raise_if_cancel_requested(state["review_run_public_id"])
         review_run = self.session.scalar(select(ReviewRun).where(ReviewRun.public_id == state["review_run_public_id"]))
-        review_run.status = "queued"
-        self.session.flush()
         submissions = self.session.scalars(
             select(Submission)
             .where(
@@ -79,15 +83,57 @@ class ReviewRunParentGraph:
         }
 
     def run_children(self, state: ReviewRunParentState) -> ReviewRunParentState:
+        self._raise_if_cancel_requested(state["review_run_public_id"])
+        completed_results = state.get("completed_results", 0)
+        manual_review_results = state.get("manual_review_results", 0)
         for submission_public_id in state.get("submission_public_ids", []):
-            self.child_graph.invoke(
-                review_run_public_id=state["review_run_public_id"],
-                submission_public_id=submission_public_id,
-                operator_id=state["operator_id"],
-            )
-        return {**state}
+            self._raise_if_cancel_requested(state["review_run_public_id"])
+            try:
+                child_state = self.child_graph.invoke(
+                    review_run_public_id=state["review_run_public_id"],
+                    submission_public_id=submission_public_id,
+                    operator_id=state["operator_id"],
+                )
+            except BackgroundJobCancelled:
+                raise
+            except Exception as exc:
+                self.audit_service.record(
+                    event_type="review_run_child_failed",
+                    object_type="submission",
+                    object_public_id=submission_public_id,
+                    payload={
+                        "review_run_public_id": state["review_run_public_id"],
+                        "error_message": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+                if hasattr(self.child_graph, "mark_submission_for_manual_review"):
+                    self.child_graph.mark_submission_for_manual_review(
+                        state={
+                            "review_run_public_id": state["review_run_public_id"],
+                            "submission_public_id": submission_public_id,
+                            "operator_id": state["operator_id"],
+                        },
+                        error_message=f"{type(exc).__name__}: {exc}",
+                        reason="review_run_parent_graph_child_failed",
+                    )
+                # 逐个提交评审结果，保证前端轮询能看到增量结果。
+                self.session.commit()
+                manual_review_results += 1
+                continue
+            if child_state.get("validation_output", {}).get("status") == "needs_manual_review":
+                manual_review_results += 1
+            else:
+                completed_results += 1
+            # 每个 submission 评审完成后立即提交，避免等整批结束后前端才看见结果。
+            self.session.commit()
+        return {
+            **state,
+            "completed_results": completed_results,
+            "manual_review_results": manual_review_results,
+        }
 
     def finalize_run(self, state: ReviewRunParentState) -> ReviewRunParentState:
+        self._raise_if_cancel_requested(state["review_run_public_id"])
         review_run = self.session.scalar(select(ReviewRun).where(ReviewRun.public_id == state["review_run_public_id"]))
         validated = [result for result in review_run.results if result.status == "validated"]
         manual = [result for result in review_run.results if result.status == "needs_manual_review"]

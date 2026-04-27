@@ -30,6 +30,12 @@ def start_review_run(review_run_public_id: str, session: Session = Depends(get_d
     return review_run_read(service.start_review_run(review_run_public_id=review_run_public_id))
 
 
+@router.post("/review-runs/{review_run_public_id}/cancel", response_model=ReviewRunRead)
+def cancel_review_run(review_run_public_id: str, session: Session = Depends(get_db)) -> ReviewRunRead:
+    service = ReviewRunService(session)
+    return review_run_read(service.cancel_review_run(review_run_public_id=review_run_public_id))
+
+
 @router.get("/review-runs/{review_run_public_id}", response_model=ReviewRunRead)
 def get_review_run(review_run_public_id: str, session: Session = Depends(get_db)) -> ReviewRunRead:
     service = ReviewRunService(session)

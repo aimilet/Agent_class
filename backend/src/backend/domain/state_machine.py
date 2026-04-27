@@ -60,17 +60,31 @@ STATE_TRANSITIONS: dict[str, dict[str, set[str]]] = {
         AssignmentStatus.ARCHIVED: set(),
     },
     "submission_import_batch": {
-        SubmissionImportBatchStatus.CREATED: {SubmissionImportBatchStatus.SCANNING, SubmissionImportBatchStatus.FAILED},
-        SubmissionImportBatchStatus.SCANNING: {SubmissionImportBatchStatus.MATCHING, SubmissionImportBatchStatus.FAILED},
+        SubmissionImportBatchStatus.CREATED: {
+            SubmissionImportBatchStatus.SCANNING,
+            SubmissionImportBatchStatus.FAILED,
+            SubmissionImportBatchStatus.CANCELLED,
+        },
+        SubmissionImportBatchStatus.SCANNING: {
+            SubmissionImportBatchStatus.MATCHING,
+            SubmissionImportBatchStatus.FAILED,
+            SubmissionImportBatchStatus.CANCELLED,
+        },
         SubmissionImportBatchStatus.MATCHING: {
             SubmissionImportBatchStatus.NEEDS_REVIEW,
             SubmissionImportBatchStatus.CONFIRMED,
             SubmissionImportBatchStatus.FAILED,
+            SubmissionImportBatchStatus.CANCELLED,
         },
-        SubmissionImportBatchStatus.NEEDS_REVIEW: {SubmissionImportBatchStatus.CONFIRMED, SubmissionImportBatchStatus.FAILED},
+        SubmissionImportBatchStatus.NEEDS_REVIEW: {
+            SubmissionImportBatchStatus.CONFIRMED,
+            SubmissionImportBatchStatus.FAILED,
+            SubmissionImportBatchStatus.CANCELLED,
+        },
         SubmissionImportBatchStatus.CONFIRMED: {SubmissionImportBatchStatus.APPLIED, SubmissionImportBatchStatus.FAILED},
         SubmissionImportBatchStatus.APPLIED: set(),
         SubmissionImportBatchStatus.FAILED: {SubmissionImportBatchStatus.SCANNING},
+        SubmissionImportBatchStatus.CANCELLED: set(),
     },
     "submission": {
         SubmissionStatus.DISCOVERED: {
@@ -127,24 +141,43 @@ STATE_TRANSITIONS: dict[str, dict[str, set[str]]] = {
         NamingOperationStatus.ROLLED_BACK: set(),
     },
     "review_prep": {
-        ReviewPrepStatus.DRAFT: {ReviewPrepStatus.MATERIAL_PARSING, ReviewPrepStatus.FAILED},
-        ReviewPrepStatus.MATERIAL_PARSING: {ReviewPrepStatus.QUESTION_STRUCTURING, ReviewPrepStatus.FAILED},
+        ReviewPrepStatus.DRAFT: {
+            ReviewPrepStatus.MATERIAL_PARSING,
+            ReviewPrepStatus.FAILED,
+            ReviewPrepStatus.CANCELLED,
+        },
+        ReviewPrepStatus.MATERIAL_PARSING: {
+            ReviewPrepStatus.QUESTION_STRUCTURING,
+            ReviewPrepStatus.FAILED,
+            ReviewPrepStatus.CANCELLED,
+        },
         ReviewPrepStatus.QUESTION_STRUCTURING: {ReviewPrepStatus.ANSWER_GENERATING, ReviewPrepStatus.NEEDS_REVIEW},
         ReviewPrepStatus.ANSWER_GENERATING: {
             ReviewPrepStatus.ANSWER_CRITIQUING,
             ReviewPrepStatus.NEEDS_REVIEW,
             ReviewPrepStatus.FAILED,
+            ReviewPrepStatus.CANCELLED,
         },
         ReviewPrepStatus.ANSWER_CRITIQUING: {
             ReviewPrepStatus.RUBRIC_GENERATING,
             ReviewPrepStatus.ANSWER_GENERATING,
             ReviewPrepStatus.NEEDS_REVIEW,
+            ReviewPrepStatus.CANCELLED,
         },
-        ReviewPrepStatus.RUBRIC_GENERATING: {ReviewPrepStatus.CONFIRMED, ReviewPrepStatus.NEEDS_REVIEW},
-        ReviewPrepStatus.NEEDS_REVIEW: {ReviewPrepStatus.CONFIRMED, ReviewPrepStatus.FAILED},
+        ReviewPrepStatus.RUBRIC_GENERATING: {
+            ReviewPrepStatus.CONFIRMED,
+            ReviewPrepStatus.NEEDS_REVIEW,
+            ReviewPrepStatus.CANCELLED,
+        },
+        ReviewPrepStatus.NEEDS_REVIEW: {
+            ReviewPrepStatus.CONFIRMED,
+            ReviewPrepStatus.FAILED,
+            ReviewPrepStatus.CANCELLED,
+        },
         ReviewPrepStatus.CONFIRMED: {ReviewPrepStatus.READY},
         ReviewPrepStatus.READY: set(),
         ReviewPrepStatus.FAILED: set(),
+        ReviewPrepStatus.CANCELLED: set(),
     },
     "review_question_item": {
         ReviewQuestionItemStatus.DRAFT: {ReviewQuestionItemStatus.GENERATED, ReviewQuestionItemStatus.DISABLED},
@@ -155,12 +188,21 @@ STATE_TRANSITIONS: dict[str, dict[str, set[str]]] = {
     },
     "review_run": {
         ReviewRunStatus.QUEUED: {ReviewRunStatus.SELECTING_ASSETS, ReviewRunStatus.CANCELLED},
-        ReviewRunStatus.SELECTING_ASSETS: {ReviewRunStatus.GRADING, ReviewRunStatus.FAILED},
-        ReviewRunStatus.GRADING: {ReviewRunStatus.VALIDATING, ReviewRunStatus.PARTIAL_FAILED},
+        ReviewRunStatus.SELECTING_ASSETS: {
+            ReviewRunStatus.GRADING,
+            ReviewRunStatus.FAILED,
+            ReviewRunStatus.CANCELLED,
+        },
+        ReviewRunStatus.GRADING: {
+            ReviewRunStatus.VALIDATING,
+            ReviewRunStatus.PARTIAL_FAILED,
+            ReviewRunStatus.CANCELLED,
+        },
         ReviewRunStatus.VALIDATING: {
             ReviewRunStatus.NEEDS_REVIEW,
             ReviewRunStatus.COMPLETED,
             ReviewRunStatus.PARTIAL_FAILED,
+            ReviewRunStatus.CANCELLED,
         },
         ReviewRunStatus.NEEDS_REVIEW: {ReviewRunStatus.COMPLETED, ReviewRunStatus.CANCELLED},
         ReviewRunStatus.COMPLETED: set(),

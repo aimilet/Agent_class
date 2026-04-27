@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from backend.agents import CourseInitAgent
 from backend.agents.base import AgentExecutor
+from backend.core.background_jobs import get_background_job_registry
 from backend.core.errors import DomainError
 from backend.db.repositories import CourseRepository, RosterRepository
 from backend.domain.state_machine import ensure_transition
@@ -38,6 +39,7 @@ class CourseInitGraph:
         self.audit_service = AuditService(session)
         self.agent = CourseInitAgent()
         self.agent_executor = AgentExecutor(session)
+        self.job_registry = get_background_job_registry()
         self.compiled = compile_graph(
             state_schema=CourseInitState,
             input_schema=CourseInitGraphInput,
@@ -69,7 +71,11 @@ class CourseInitGraph:
             fallback_state = node(fallback_state)
         return fallback_state
 
+    def _raise_if_cancel_requested(self, state: CourseInitState) -> None:
+        self.job_registry.raise_if_cancel_requested("roster_import_batch", state["batch_public_id"])
+
     def load_material_manifest(self, state: CourseInitState) -> CourseInitState:
+        self._raise_if_cancel_requested(state)
         course = self.course_repo.get_by_public_id(state["course_public_id"])
         batch = self.roster_repo.get_batch(state["batch_public_id"])
         ensure_transition("course", course.status, "initializing")
@@ -94,6 +100,7 @@ class CourseInitGraph:
         }
 
     def run_agent(self, state: CourseInitState) -> CourseInitState:
+        self._raise_if_cancel_requested(state)
         course = self.course_repo.get_by_public_id(state["course_public_id"])
         envelope = AgentInputEnvelope(
             run_context=AgentRunContext(
@@ -133,6 +140,7 @@ class CourseInitGraph:
         }
 
     def persist_candidates(self, state: CourseInitState) -> CourseInitState:
+        self._raise_if_cancel_requested(state)
         batch = self.roster_repo.get_batch(state["batch_public_id"])
         candidates = self.roster_repo.replace_candidates(
             batch,
@@ -156,6 +164,7 @@ class CourseInitGraph:
         return {**state}
 
     def finalize_batch(self, state: CourseInitState) -> CourseInitState:
+        self._raise_if_cancel_requested(state)
         batch = self.roster_repo.get_batch(state["batch_public_id"])
         self.audit_service.record(
             event_type="roster_import_parsed",

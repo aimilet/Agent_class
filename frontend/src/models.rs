@@ -3,11 +3,26 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ReviewRuntimeSettingsRead {
+    pub review_prep_max_answer_rounds: i64,
+    pub review_run_enable_validation_agent: bool,
+    pub review_run_default_parallelism: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewRuntimeSettingsUpdate {
+    pub review_prep_max_answer_rounds: i64,
+    pub review_run_enable_validation_agent: bool,
+    pub review_run_default_parallelism: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct HealthResponse {
     pub app_name: String,
     pub database_url: String,
     pub runtime_root: String,
     pub llm_enabled: bool,
+    pub review_runtime_settings: ReviewRuntimeSettingsRead,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

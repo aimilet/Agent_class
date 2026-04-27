@@ -10,6 +10,7 @@ from fastapi import UploadFile
 
 from backend.core.errors import DomainError
 from backend.core.ids import generate_public_id
+from backend.core.pathing import resolve_user_path
 from backend.core.settings import get_settings
 
 
@@ -22,7 +23,7 @@ class StoredFile:
 
 
 def ensure_existing_path(path: str | Path) -> Path:
-    resolved = Path(path).expanduser().resolve()
+    resolved = resolve_user_path(path)
     if not resolved.exists():
         raise DomainError("路径不存在。", code="path_not_found", status_code=404, detail={"path": str(resolved)})
     return resolved

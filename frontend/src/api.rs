@@ -2,8 +2,8 @@ use std::fs::File;
 use std::path::Path;
 use std::time::Duration;
 
-use reqwest::blocking::{multipart, Client, Response};
 use reqwest::StatusCode;
+use reqwest::blocking::{Client, Response, multipart};
 use serde::de::DeserializeOwned;
 
 use crate::models::{
@@ -11,9 +11,10 @@ use crate::models::{
     AuditEventRead, CourseCreate, CourseEnrollmentRead, CourseRead, DashboardSnapshot,
     HealthResponse, ManualReviewUpdate, NamingPlanCreate, NamingPlanRead, NamingPolicyCreate,
     NamingPolicyRead, ReviewQuestionItemPatch, ReviewQuestionItemRead, ReviewResultRead,
-    ReviewRunCreate, ReviewRunRead, RosterCandidateRead, RosterImportBatchRead,
-    RosterImportConfirmRequest, SubmissionImportBatchCreate, SubmissionImportBatchRead,
-    SubmissionImportConfirmRequest, SubmissionRead, ToolCallLogRead,
+    ReviewRunCreate, ReviewRunRead, ReviewRuntimeSettingsRead, ReviewRuntimeSettingsUpdate,
+    RosterCandidateRead, RosterImportBatchRead, RosterImportConfirmRequest,
+    SubmissionImportBatchCreate, SubmissionImportBatchRead, SubmissionImportConfirmRequest,
+    SubmissionRead, ToolCallLogRead,
 };
 
 #[derive(Clone)]
@@ -44,6 +45,17 @@ impl ApiClient {
         self.get_json("/health")
     }
 
+    pub fn get_review_settings(&self) -> Result<ReviewRuntimeSettingsRead, String> {
+        self.get_json("/system/review-settings")
+    }
+
+    pub fn update_review_settings(
+        &self,
+        payload: &ReviewRuntimeSettingsUpdate,
+    ) -> Result<ReviewRuntimeSettingsRead, String> {
+        self.put_json("/system/review-settings", payload)
+    }
+
     pub fn create_course(&self, payload: &CourseCreate) -> Result<CourseRead, String> {
         self.post_json("/courses", payload)
     }
@@ -52,7 +64,10 @@ impl ApiClient {
         self.get_json("/courses")
     }
 
-    pub fn list_enrollments(&self, course_public_id: &str) -> Result<Vec<CourseEnrollmentRead>, String> {
+    pub fn list_enrollments(
+        &self,
+        course_public_id: &str,
+    ) -> Result<Vec<CourseEnrollmentRead>, String> {
         self.get_json(&format!("/courses/{course_public_id}/enrollments"))
     }
 
@@ -83,11 +98,31 @@ impl ApiClient {
         Self::parse_json(response)
     }
 
-    pub fn run_roster_import(&self, batch_public_id: &str) -> Result<RosterImportBatchRead, String> {
+    pub fn run_roster_import(
+        &self,
+        batch_public_id: &str,
+    ) -> Result<RosterImportBatchRead, String> {
         self.post_empty(&format!("/roster-imports/{batch_public_id}/run"))
     }
 
-    pub fn list_roster_candidates(&self, batch_public_id: &str) -> Result<Vec<RosterCandidateRead>, String> {
+    pub fn cancel_roster_import(
+        &self,
+        batch_public_id: &str,
+    ) -> Result<RosterImportBatchRead, String> {
+        self.post_empty(&format!("/roster-imports/{batch_public_id}/cancel"))
+    }
+
+    pub fn get_roster_import(
+        &self,
+        batch_public_id: &str,
+    ) -> Result<RosterImportBatchRead, String> {
+        self.get_json(&format!("/roster-imports/{batch_public_id}"))
+    }
+
+    pub fn list_roster_candidates(
+        &self,
+        batch_public_id: &str,
+    ) -> Result<Vec<RosterCandidateRead>, String> {
         self.get_json(&format!("/roster-imports/{batch_public_id}/candidates"))
     }
 
@@ -96,14 +131,24 @@ impl ApiClient {
         batch_public_id: &str,
         payload: &RosterImportConfirmRequest,
     ) -> Result<RosterImportBatchRead, String> {
-        self.post_json(&format!("/roster-imports/{batch_public_id}/confirm"), payload)
+        self.post_json(
+            &format!("/roster-imports/{batch_public_id}/confirm"),
+            payload,
+        )
     }
 
-    pub fn apply_roster_import(&self, batch_public_id: &str) -> Result<RosterImportBatchRead, String> {
+    pub fn apply_roster_import(
+        &self,
+        batch_public_id: &str,
+    ) -> Result<RosterImportBatchRead, String> {
         self.post_empty(&format!("/roster-imports/{batch_public_id}/apply"))
     }
 
-    pub fn create_assignment(&self, course_public_id: &str, payload: &AssignmentCreate) -> Result<AssignmentRead, String> {
+    pub fn create_assignment(
+        &self,
+        course_public_id: &str,
+        payload: &AssignmentCreate,
+    ) -> Result<AssignmentRead, String> {
         self.post_json(&format!("/courses/{course_public_id}/assignments"), payload)
     }
 
@@ -116,15 +161,40 @@ impl ApiClient {
         assignment_public_id: &str,
         payload: &SubmissionImportBatchCreate,
     ) -> Result<SubmissionImportBatchRead, String> {
-        self.post_json(&format!("/assignments/{assignment_public_id}/submission-imports"), payload)
+        self.post_json(
+            &format!("/assignments/{assignment_public_id}/submission-imports"),
+            payload,
+        )
     }
 
-    pub fn run_submission_import(&self, batch_public_id: &str) -> Result<SubmissionImportBatchRead, String> {
+    pub fn run_submission_import(
+        &self,
+        batch_public_id: &str,
+    ) -> Result<SubmissionImportBatchRead, String> {
         self.post_empty(&format!("/submission-imports/{batch_public_id}/run"))
     }
 
-    pub fn list_batch_submissions(&self, batch_public_id: &str) -> Result<Vec<SubmissionRead>, String> {
-        self.get_json(&format!("/submission-imports/{batch_public_id}/submissions"))
+    pub fn cancel_submission_import(
+        &self,
+        batch_public_id: &str,
+    ) -> Result<SubmissionImportBatchRead, String> {
+        self.post_empty(&format!("/submission-imports/{batch_public_id}/cancel"))
+    }
+
+    pub fn get_submission_import(
+        &self,
+        batch_public_id: &str,
+    ) -> Result<SubmissionImportBatchRead, String> {
+        self.get_json(&format!("/submission-imports/{batch_public_id}"))
+    }
+
+    pub fn list_batch_submissions(
+        &self,
+        batch_public_id: &str,
+    ) -> Result<Vec<SubmissionRead>, String> {
+        self.get_json(&format!(
+            "/submission-imports/{batch_public_id}/submissions"
+        ))
     }
 
     pub fn confirm_submission_import(
@@ -132,14 +202,23 @@ impl ApiClient {
         batch_public_id: &str,
         payload: &SubmissionImportConfirmRequest,
     ) -> Result<SubmissionImportBatchRead, String> {
-        self.post_json(&format!("/submission-imports/{batch_public_id}/confirm"), payload)
+        self.post_json(
+            &format!("/submission-imports/{batch_public_id}/confirm"),
+            payload,
+        )
     }
 
-    pub fn apply_submission_import(&self, batch_public_id: &str) -> Result<SubmissionImportBatchRead, String> {
+    pub fn apply_submission_import(
+        &self,
+        batch_public_id: &str,
+    ) -> Result<SubmissionImportBatchRead, String> {
         self.post_empty(&format!("/submission-imports/{batch_public_id}/apply"))
     }
 
-    pub fn list_assignment_submissions(&self, assignment_public_id: &str) -> Result<Vec<SubmissionRead>, String> {
+    pub fn list_assignment_submissions(
+        &self,
+        assignment_public_id: &str,
+    ) -> Result<Vec<SubmissionRead>, String> {
         self.get_json(&format!("/assignments/{assignment_public_id}/submissions"))
     }
 
@@ -148,11 +227,19 @@ impl ApiClient {
         assignment_public_id: &str,
         payload: &NamingPolicyCreate,
     ) -> Result<NamingPolicyRead, String> {
-        self.post_json(&format!("/assignments/{assignment_public_id}/naming-policies"), payload)
+        self.post_json(
+            &format!("/assignments/{assignment_public_id}/naming-policies"),
+            payload,
+        )
     }
 
-    pub fn list_naming_policies(&self, assignment_public_id: &str) -> Result<Vec<NamingPolicyRead>, String> {
-        self.get_json(&format!("/assignments/{assignment_public_id}/naming-policies"))
+    pub fn list_naming_policies(
+        &self,
+        assignment_public_id: &str,
+    ) -> Result<Vec<NamingPolicyRead>, String> {
+        self.get_json(&format!(
+            "/assignments/{assignment_public_id}/naming-policies"
+        ))
     }
 
     pub fn create_naming_plan(
@@ -160,14 +247,20 @@ impl ApiClient {
         assignment_public_id: &str,
         payload: &NamingPlanCreate,
     ) -> Result<NamingPlanRead, String> {
-        self.post_json(&format!("/assignments/{assignment_public_id}/naming-plans"), payload)
+        self.post_json(
+            &format!("/assignments/{assignment_public_id}/naming-plans"),
+            payload,
+        )
     }
 
     pub fn get_naming_plan(&self, plan_public_id: &str) -> Result<NamingPlanRead, String> {
         self.get_json(&format!("/naming-plans/{plan_public_id}"))
     }
 
-    pub fn submit_naming_plan_approval(&self, plan_public_id: &str) -> Result<ApprovalTaskRead, String> {
+    pub fn submit_naming_plan_approval(
+        &self,
+        plan_public_id: &str,
+    ) -> Result<ApprovalTaskRead, String> {
         self.post_empty(&format!("/naming-plans/{plan_public_id}/submit-approval"))
     }
 
@@ -205,15 +298,31 @@ impl ApiClient {
         Self::parse_json(response)
     }
 
-    pub fn run_review_prep(&self, review_prep_public_id: &str) -> Result<crate::models::ReviewPrepRead, String> {
+    pub fn run_review_prep(
+        &self,
+        review_prep_public_id: &str,
+    ) -> Result<crate::models::ReviewPrepRead, String> {
         self.post_empty(&format!("/review-preps/{review_prep_public_id}/run"))
     }
 
-    pub fn get_review_prep(&self, review_prep_public_id: &str) -> Result<crate::models::ReviewPrepRead, String> {
+    pub fn cancel_review_prep(
+        &self,
+        review_prep_public_id: &str,
+    ) -> Result<crate::models::ReviewPrepRead, String> {
+        self.post_empty(&format!("/review-preps/{review_prep_public_id}/cancel"))
+    }
+
+    pub fn get_review_prep(
+        &self,
+        review_prep_public_id: &str,
+    ) -> Result<crate::models::ReviewPrepRead, String> {
         self.get_json(&format!("/review-preps/{review_prep_public_id}"))
     }
 
-    pub fn list_review_questions(&self, review_prep_public_id: &str) -> Result<Vec<ReviewQuestionItemRead>, String> {
+    pub fn list_review_questions(
+        &self,
+        review_prep_public_id: &str,
+    ) -> Result<Vec<ReviewQuestionItemRead>, String> {
         self.get_json(&format!("/review-preps/{review_prep_public_id}/questions"))
     }
 
@@ -225,23 +334,40 @@ impl ApiClient {
         self.patch_json(&format!("/review-question-items/{item_public_id}"), payload)
     }
 
-    pub fn confirm_review_prep(&self, review_prep_public_id: &str) -> Result<crate::models::ReviewPrepRead, String> {
+    pub fn confirm_review_prep(
+        &self,
+        review_prep_public_id: &str,
+    ) -> Result<crate::models::ReviewPrepRead, String> {
         self.post_empty(&format!("/review-preps/{review_prep_public_id}/confirm"))
     }
 
-    pub fn create_review_run(&self, assignment_public_id: &str, payload: &ReviewRunCreate) -> Result<ReviewRunRead, String> {
-        self.post_json(&format!("/assignments/{assignment_public_id}/review-runs"), payload)
+    pub fn create_review_run(
+        &self,
+        assignment_public_id: &str,
+        payload: &ReviewRunCreate,
+    ) -> Result<ReviewRunRead, String> {
+        self.post_json(
+            &format!("/assignments/{assignment_public_id}/review-runs"),
+            payload,
+        )
     }
 
     pub fn start_review_run(&self, review_run_public_id: &str) -> Result<ReviewRunRead, String> {
         self.post_empty(&format!("/review-runs/{review_run_public_id}/start"))
     }
 
+    pub fn cancel_review_run(&self, review_run_public_id: &str) -> Result<ReviewRunRead, String> {
+        self.post_empty(&format!("/review-runs/{review_run_public_id}/cancel"))
+    }
+
     pub fn get_review_run(&self, review_run_public_id: &str) -> Result<ReviewRunRead, String> {
         self.get_json(&format!("/review-runs/{review_run_public_id}"))
     }
 
-    pub fn list_review_results(&self, review_run_public_id: &str) -> Result<Vec<ReviewResultRead>, String> {
+    pub fn list_review_results(
+        &self,
+        review_run_public_id: &str,
+    ) -> Result<Vec<ReviewResultRead>, String> {
         self.get_json(&format!("/review-runs/{review_run_public_id}/results"))
     }
 
@@ -250,40 +376,75 @@ impl ApiClient {
         review_result_public_id: &str,
         payload: &ManualReviewUpdate,
     ) -> Result<ReviewResultRead, String> {
-        self.patch_json(&format!("/review-results/{review_result_public_id}/manual-review"), payload)
+        self.patch_json(
+            &format!("/review-results/{review_result_public_id}/manual-review"),
+            payload,
+        )
     }
 
     pub fn retry_review_run(&self, review_run_public_id: &str) -> Result<ReviewRunRead, String> {
         self.post_empty(&format!("/review-runs/{review_run_public_id}/retry-failed"))
     }
 
-    pub fn publish_review_run(&self, review_run_public_id: &str) -> Result<ApprovalTaskRead, String> {
+    pub fn publish_review_run(
+        &self,
+        review_run_public_id: &str,
+    ) -> Result<ApprovalTaskRead, String> {
         self.post_empty(&format!("/review-runs/{review_run_public_id}/publish"))
     }
 
-    pub fn approve_task(&self, approval_task_public_id: &str, note: Option<String>) -> Result<ApprovalTaskRead, String> {
-        let payload = ApprovalDecisionRequest { operator_note: note };
-        self.post_json(&format!("/approval-tasks/{approval_task_public_id}/approve"), &payload)
+    pub fn approve_task(
+        &self,
+        approval_task_public_id: &str,
+        note: Option<String>,
+    ) -> Result<ApprovalTaskRead, String> {
+        let payload = ApprovalDecisionRequest {
+            operator_note: note,
+        };
+        self.post_json(
+            &format!("/approval-tasks/{approval_task_public_id}/approve"),
+            &payload,
+        )
     }
 
-    pub fn reject_task(&self, approval_task_public_id: &str, note: Option<String>) -> Result<ApprovalTaskRead, String> {
-        let payload = ApprovalDecisionRequest { operator_note: note };
-        self.post_json(&format!("/approval-tasks/{approval_task_public_id}/reject"), &payload)
+    pub fn reject_task(
+        &self,
+        approval_task_public_id: &str,
+        note: Option<String>,
+    ) -> Result<ApprovalTaskRead, String> {
+        let payload = ApprovalDecisionRequest {
+            operator_note: note,
+        };
+        self.post_json(
+            &format!("/approval-tasks/{approval_task_public_id}/reject"),
+            &payload,
+        )
     }
 
-    pub fn execute_approval_task(&self, approval_task_public_id: &str) -> Result<ApprovalTaskRead, String> {
-        self.post_empty(&format!("/approval-tasks/{approval_task_public_id}/execute"))
+    pub fn execute_approval_task(
+        &self,
+        approval_task_public_id: &str,
+    ) -> Result<ApprovalTaskRead, String> {
+        self.post_empty(&format!(
+            "/approval-tasks/{approval_task_public_id}/execute"
+        ))
     }
 
     pub fn list_agent_runs(&self) -> Result<Vec<AgentRunRead>, String> {
         self.get_json("/agent-runs")
     }
 
-    pub fn list_tool_calls(&self, agent_run_public_id: &str) -> Result<Vec<ToolCallLogRead>, String> {
+    pub fn list_tool_calls(
+        &self,
+        agent_run_public_id: &str,
+    ) -> Result<Vec<ToolCallLogRead>, String> {
         self.get_json(&format!("/agent-runs/{agent_run_public_id}/tool-calls"))
     }
 
-    pub fn list_course_audit_events(&self, course_public_id: &str) -> Result<Vec<AuditEventRead>, String> {
+    pub fn list_course_audit_events(
+        &self,
+        course_public_id: &str,
+    ) -> Result<Vec<AuditEventRead>, String> {
         self.get_json(&format!("/courses/{course_public_id}/audit-events"))
     }
 
@@ -296,7 +457,11 @@ impl ApiClient {
         Self::parse_json(response)
     }
 
-    fn post_json<T: DeserializeOwned, P: serde::Serialize>(&self, path: &str, payload: &P) -> Result<T, String> {
+    fn post_json<T: DeserializeOwned, P: serde::Serialize>(
+        &self,
+        path: &str,
+        payload: &P,
+    ) -> Result<T, String> {
         let response = self
             .http
             .post(self.url(path))
@@ -306,7 +471,11 @@ impl ApiClient {
         Self::parse_json(response)
     }
 
-    fn patch_json<T: DeserializeOwned, P: serde::Serialize>(&self, path: &str, payload: &P) -> Result<T, String> {
+    fn patch_json<T: DeserializeOwned, P: serde::Serialize>(
+        &self,
+        path: &str,
+        payload: &P,
+    ) -> Result<T, String> {
         let response = self
             .http
             .patch(self.url(path))
@@ -320,6 +489,20 @@ impl ApiClient {
         let response = self
             .http
             .post(self.url(path))
+            .send()
+            .map_err(|err| format!("请求 {path} 失败：{err}"))?;
+        Self::parse_json(response)
+    }
+
+    fn put_json<T: DeserializeOwned, P: serde::Serialize>(
+        &self,
+        path: &str,
+        payload: &P,
+    ) -> Result<T, String> {
+        let response = self
+            .http
+            .put(self.url(path))
+            .json(payload)
             .send()
             .map_err(|err| format!("请求 {path} 失败：{err}"))?;
         Self::parse_json(response)
@@ -349,7 +532,10 @@ impl ApiClient {
             return format!("HTTP {status}");
         }
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if let Some(message) = json.pointer("/error/message").and_then(|value| value.as_str()) {
+            if let Some(message) = json
+                .pointer("/error/message")
+                .and_then(|value| value.as_str())
+            {
                 return format!("HTTP {status}: {message}");
             }
             if let Some(detail) = json.get("detail") {
