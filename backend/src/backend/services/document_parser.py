@@ -80,21 +80,21 @@ class DocumentParser:
         self._ocr_engine: RapidOCR | None = None
         self._ocr_error: str | None = None
 
-    def parse(self, file_path: str | Path) -> ParsedDocument:
+    def parse(self, file_path: str | Path, *, include_ocr: bool = True) -> ParsedDocument:
         resolved = Path(file_path).expanduser().resolve()
         suffix = resolved.suffix.lower()
         if suffix in TEXT_SUFFIXES | CODE_SUFFIXES:
             return self._trim(self._parse_text(resolved))
         if suffix == ".docx":
-            return self._trim(self._parse_docx(resolved))
+            return self._trim(self._parse_docx(resolved, include_ocr=include_ocr))
         if suffix == ".pdf":
-            return self._trim(self._parse_pdf(resolved))
+            return self._trim(self._parse_pdf(resolved, include_ocr=include_ocr))
         if suffix in PRESENTATION_SUFFIXES:
-            return self._trim(self._parse_presentation(resolved))
+            return self._trim(self._parse_presentation(resolved, include_ocr=include_ocr))
         if suffix in LEGACY_PRESENTATION_SUFFIXES:
-            return self._trim(self._parse_legacy_presentation(resolved))
+            return self._trim(self._parse_legacy_presentation(resolved, include_ocr=include_ocr))
         if suffix in IMAGE_SUFFIXES:
-            return self._trim(self._parse_image(resolved))
+            return self._trim(self._parse_image(resolved, include_ocr=include_ocr))
         raise ValueError(f"暂不支持的作业格式：{suffix}")
 
     def supports(self, file_path: str | Path) -> bool:
@@ -198,12 +198,15 @@ class DocumentParser:
                 continue
         raise ValueError("文本文件编码无法识别。")
 
-    def _parse_image(self, file_path: Path) -> ParsedDocument:
+    def _parse_image(self, file_path: Path, *, include_ocr: bool = True) -> ParsedDocument:
         image = Image.open(file_path)
-        ocr_text, notes = self._ocr_image_file(file_path)
+        if include_ocr:
+            ocr_text, notes = self._ocr_image_file(file_path)
+        else:
+            ocr_text, notes = "", []
         notes = [f"图片尺寸：{image.width}x{image.height}", *notes]
         return ParsedDocument(
-            parser_name="image+ocr",
+            parser_name="image+ocr" if include_ocr else "image",
             text=ocr_text,
             notes=notes,
             images_detected=1,
@@ -216,7 +219,7 @@ class DocumentParser:
             ],
         )
 
-    def _parse_docx(self, file_path: Path) -> ParsedDocument:
+    def _parse_docx(self, file_path: Path, *, include_ocr: bool = True) -> ParsedDocument:
         document = Document(str(file_path))
         notes: list[str] = []
         segments: list[str] = []
@@ -234,7 +237,6 @@ class DocumentParser:
         if table_rows:
             segments.append("[表格]\n" + "\n".join(table_rows))
 
-        ocr_blocks: list[str] = []
         images_detected = 0
         visual_assets: list[VisualAsset] = []
         for relation in document.part.rels.values():
@@ -250,29 +252,27 @@ class DocumentParser:
                     data=blob,
                 )
             )
-            text, image_notes = self._ocr_image_bytes(blob, suffix)
-            notes.extend(f"文档图片：{note}" for note in image_notes)
-            if text:
-                ocr_blocks.append(text)
-
-        if ocr_blocks:
-            segments.append("[文档内图片 OCR]\n" + "\n\n".join(ocr_blocks))
+            if include_ocr:
+                text, image_notes = self._ocr_image_bytes(blob, suffix)
+                notes.extend(f"文档图片：{note}" for note in image_notes)
+                if text:
+                    segments.append("[文档内图片 OCR]\n" + text)
+        if images_detected:
             notes.append(f"共识别到 {images_detected} 张内嵌图片")
 
         return ParsedDocument(
-            parser_name="docx+ocr",
+            parser_name="docx+ocr" if include_ocr else "docx",
             text="\n\n".join(segment for segment in segments if segment),
             notes=notes,
             images_detected=images_detected,
             visual_assets=visual_assets,
         )
 
-    def _parse_pdf(self, file_path: Path) -> ParsedDocument:
+    def _parse_pdf(self, file_path: Path, *, include_ocr: bool = True) -> ParsedDocument:
         reader = PdfReader(str(file_path))
         notes: list[str] = []
         segments: list[str] = []
         images_detected = 0
-        image_texts: list[str] = []
         visual_assets: list[VisualAsset] = []
 
         for page_number, page in enumerate(reader.pages, start=1):
@@ -298,27 +298,25 @@ class DocumentParser:
                         data=data,
                     )
                 )
-                text, image_notes = self._ocr_image_bytes(data, Path(name).suffix or ".png")
-                notes.extend(f"PDF 图片：{note}" for note in image_notes)
-                if text:
-                    image_texts.append(f"[PDF 第 {page_number} 页图片 OCR]\n{text}")
-
-        if image_texts:
-            segments.append("\n\n".join(image_texts))
+                if include_ocr:
+                    text, image_notes = self._ocr_image_bytes(data, Path(name).suffix or ".png")
+                    notes.extend(f"PDF 图片：{note}" for note in image_notes)
+                    if text:
+                        segments.append(f"[PDF 第 {page_number} 页图片 OCR]\n{text}")
         if images_detected:
             notes.append(f"共识别到 {images_detected} 张 PDF 内图片")
         if not segments:
             notes.append("PDF 未提取到文字内容")
 
         return ParsedDocument(
-            parser_name="pdf+ocr",
+            parser_name="pdf+ocr" if include_ocr else "pdf",
             text="\n\n".join(segment for segment in segments if segment),
             notes=notes,
             images_detected=images_detected,
             visual_assets=visual_assets,
         )
 
-    def _parse_presentation(self, file_path: Path) -> ParsedDocument:
+    def _parse_presentation(self, file_path: Path, *, include_ocr: bool = True) -> ParsedDocument:
         presentation = Presentation(str(file_path))
         notes: list[str] = []
         segments: list[str] = []
@@ -356,10 +354,11 @@ class DocumentParser:
                             data=blob,
                         )
                     )
-                    ocr_text, image_notes = self._ocr_image_bytes(blob, suffix)
-                    notes.extend(f"PPT 图片：{note}" for note in image_notes)
-                    if ocr_text:
-                        slide_segments.append("[图片 OCR]\n" + ocr_text)
+                    if include_ocr:
+                        ocr_text, image_notes = self._ocr_image_bytes(blob, suffix)
+                        notes.extend(f"PPT 图片：{note}" for note in image_notes)
+                        if ocr_text:
+                            slide_segments.append("[图片 OCR]\n" + ocr_text)
 
             if slide_segments:
                 segments.append(f"[第 {slide_index} 页]\n" + "\n\n".join(slide_segments))
@@ -370,20 +369,20 @@ class DocumentParser:
             notes.append("PPT 未提取到文本内容")
 
         return ParsedDocument(
-            parser_name="pptx+ocr",
+            parser_name="pptx+ocr" if include_ocr else "pptx",
             text="\n\n".join(segments),
             notes=notes,
             images_detected=images_detected,
             visual_assets=visual_assets,
         )
 
-    def _parse_legacy_presentation(self, file_path: Path) -> ParsedDocument:
+    def _parse_legacy_presentation(self, file_path: Path, *, include_ocr: bool = True) -> ParsedDocument:
         converted_pdf = self._convert_with_soffice(file_path, "pdf")
         if converted_pdf is not None:
             try:
-                parsed = self._parse_pdf(converted_pdf)
+                parsed = self._parse_pdf(converted_pdf, include_ocr=include_ocr)
                 return ParsedDocument(
-                    parser_name="ppt-via-soffice+pdf",
+                    parser_name="ppt-via-soffice+pdf" if include_ocr else "ppt-via-soffice",
                     text=parsed.text,
                     notes=["旧版 PPT 已通过 LibreOffice 转 PDF 解析", *parsed.notes],
                     images_detected=parsed.images_detected,

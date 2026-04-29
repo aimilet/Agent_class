@@ -11,7 +11,7 @@ from backend.core.runtime_review_settings import RuntimeReviewSettingsStore
 from backend.core.settings import get_settings
 from backend.db.session import SessionLocal
 from backend.db.repositories import ApprovalRepository, AssignmentRepository
-from backend.domain.models import ReviewPrep, ReviewResult, ReviewRun
+from backend.domain.models import ApprovalTask, ReviewPrep, ReviewResult, ReviewRun, Submission
 from backend.graphs.review_run_parent_graph import ReviewRunParentGraph
 from backend.infra.observability import AuditService
 
@@ -97,6 +97,9 @@ class ReviewRunService:
                 selectinload(ReviewRun.assignment),
                 selectinload(ReviewRun.review_prep).selectinload(ReviewPrep.question_items),
                 selectinload(ReviewRun.results).selectinload(ReviewResult.item_results),
+                selectinload(ReviewRun.results)
+                .selectinload(ReviewResult.submission)
+                .selectinload(Submission.enrollment),
             )
             .where(ReviewRun.public_id == review_run_public_id)
         )
@@ -144,18 +147,24 @@ class ReviewRunService:
 
     def publish(self, *, review_run_public_id: str, operator_id: str = "system"):
         review_run = self.get_review_run(review_run_public_id)
+        existing_task = self._get_active_publish_task(review_run.public_id)
+        if existing_task is not None:
+            return existing_task
+        publishable_results = [result for result in review_run.results if result.status in {"validated", "finalized"}]
+        if not publishable_results:
+            raise DomainError("当前评审运行没有可发布的评审结果。", code="no_publishable_review_results", status_code=409)
         task = self.approval_repo.create(
             object_type="review_run",
             object_public_id=review_run.public_id,
             action_type="publish",
             title="评审结果发布审批",
-            summary=f"准备发布 {len(review_run.results)} 条评审结果。",
+            summary=f"准备发布 {len(publishable_results)} 条评审结果。",
             command_preview_json=[
                 {"review_result_public_id": result.public_id, "action": "publish"}
-                for result in review_run.results
+                for result in publishable_results
             ],
         )
-        for result in review_run.results:
+        for result in publishable_results:
             self.approval_repo.add_item(
                 task,
                 item_type="publish_review_result",
@@ -173,6 +182,19 @@ class ReviewRunService:
         )
         self.session.commit()
         return task
+
+    def _get_active_publish_task(self, review_run_public_id: str) -> ApprovalTask | None:
+        return self.session.scalar(
+            select(ApprovalTask)
+            .options(selectinload(ApprovalTask.items))
+            .where(
+                ApprovalTask.object_type == "review_run",
+                ApprovalTask.object_public_id == review_run_public_id,
+                ApprovalTask.action_type == "publish",
+                ApprovalTask.status.in_(["pending", "approved", "executing"]),
+            )
+            .order_by(ApprovalTask.updated_at.desc(), ApprovalTask.id.desc())
+        )
 
     def _run_review_run_in_background(self, review_run_public_id: str, operator_id: str, retry_failed: bool) -> None:
         session = SessionLocal()

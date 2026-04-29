@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from typing import Any, TypedDict
 
 from sqlalchemy import select
@@ -9,15 +10,18 @@ from sqlalchemy.orm import Session
 from backend.agents import AssetSelectorAgent, GradingAgent, GradingValidatorAgent
 from backend.agents.base import AgentExecutor
 from backend.core.background_jobs import BackgroundJobCancelled, get_background_job_registry
+from backend.core.ids import generate_public_id
 from backend.core.runtime_review_settings import RuntimeReviewSettingsStore
 from backend.core.settings import get_settings
 from backend.domain.models import AssetSelectionResult, ReviewItemResult, ReviewResult, ReviewRun, Submission
 from backend.graphs.common import compile_graph
-from backend.infra.llm import build_file_message_parts
 from backend.infra.observability import AuditService
 from backend.schemas.common import AgentInputEnvelope, AgentRunContext, AgentTaskContext
-from backend.services.document_parser import DocumentParser
+from backend.services.document_parser import LEGACY_PRESENTATION_SUFFIXES, PRESENTATION_SUFFIXES, DocumentParser, VisualAsset
 from backend.services.submission_bundle import SubmissionBundleParser
+
+
+REVIEW_EXTRACTION_SUFFIXES = {".docx", ".pdf", *PRESENTATION_SUFFIXES, *LEGACY_PRESENTATION_SUFFIXES}
 
 
 class SubmissionReviewGraphInput(TypedDict):
@@ -30,6 +34,7 @@ class SubmissionReviewState(SubmissionReviewGraphInput, total=False):
     selected_assets: list[dict[str, Any]]
     ignored_assets: list[dict[str, Any]]
     submission_text: str
+    extracted_visual_assets: list[dict[str, Any]]
     grading_output: dict[str, Any]
     validation_output: dict[str, Any]
 
@@ -146,24 +151,53 @@ class SubmissionReviewGraph:
 
     def parse_assets(self, state: SubmissionReviewState) -> SubmissionReviewState:
         texts: list[str] = []
-        for asset in state["selected_assets"][: self.settings.vision_max_assets_per_submission]:
+        extracted_visual_assets: list[dict[str, Any]] = []
+        runtime_settings = self.runtime_settings_store.load()
+        vision_limit = runtime_settings.vision_max_assets_per_submission
+        for asset in state["selected_assets"][:vision_limit]:
             self._raise_if_cancel_requested(state["review_run_public_id"])
-            if not asset.get("real_path"):
+            if len(extracted_visual_assets) >= vision_limit:
+                break
+            raw_path = asset.get("real_path")
+            if not raw_path:
                 continue
-            if build_file_message_parts([asset], path_key="real_path", filename_key="logical_path", image_limit=1):
+            path = Path(raw_path).expanduser().resolve()
+            if path.suffix.lower() not in REVIEW_EXTRACTION_SUFFIXES:
                 continue
             try:
-                parsed = self.parser.parse(asset["real_path"])
+                parsed = self.parser.parse(path, include_ocr=False)
                 if parsed.text.strip():
-                    texts.append(parsed.text.strip())
+                    texts.append(self._format_parsed_text(asset=asset, text=parsed.text))
+                extracted_visual_assets.extend(
+                    self._persist_visual_assets(
+                        review_run_public_id=state["review_run_public_id"],
+                        submission_public_id=state["submission_public_id"],
+                        source_asset=asset,
+                        visual_assets=parsed.visual_assets,
+                        remaining_slots=vision_limit - len(extracted_visual_assets),
+                    )
+                )
             except Exception:
                 try:
-                    bundle = self.bundle_parser.parse_submission(asset["real_path"])
+                    bundle = self.bundle_parser.parse_submission(path)
                 except Exception:
                     continue
                 if bundle.text.strip():
-                    texts.append(bundle.text.strip())
-        return {**state, "submission_text": "\n\n".join(texts)}
+                    texts.append(self._format_parsed_text(asset=asset, text=bundle.text))
+                extracted_visual_assets.extend(
+                    self._persist_visual_assets(
+                        review_run_public_id=state["review_run_public_id"],
+                        submission_public_id=state["submission_public_id"],
+                        source_asset=asset,
+                        visual_assets=bundle.visual_assets,
+                        remaining_slots=vision_limit - len(extracted_visual_assets),
+                    )
+                )
+        return {
+            **state,
+            "submission_text": "\n\n".join(texts),
+            "extracted_visual_assets": extracted_visual_assets,
+        }
 
     def grade_submission(self, state: SubmissionReviewState) -> SubmissionReviewState:
         self._raise_if_cancel_requested(state["review_run_public_id"])
@@ -195,10 +229,12 @@ class SubmissionReviewGraph:
                 ),
                 task_context=AgentTaskContext(now=datetime.now(), operator_id=state["operator_id"]),
                 payload={
-                    "submission_text": state["submission_text"],
+                    "submission_text": state.get("submission_text", ""),
                     "reference_text": reference_text,
-                    "score_scale": self.settings.default_review_scale,
+                    "score_scale": runtime_settings.default_review_scale,
                     "selected_assets": state["selected_assets"],
+                    "extracted_visual_assets": state.get("extracted_visual_assets", []),
+                    "vision_max_assets_per_submission": runtime_settings.vision_max_assets_per_submission,
                 },
             ),
             handler=self.grading_agent,
@@ -243,6 +279,60 @@ class SubmissionReviewGraph:
             "validation_output": validation_structured_output,
         }
 
+    def _format_parsed_text(self, *, asset: dict[str, Any], text: str) -> str:
+        display_name = asset.get("logical_path") or asset.get("real_path") or "未命名文件"
+        return f"[提取正文] {display_name}\n{text.strip()}"
+
+    def _persist_visual_assets(
+        self,
+        *,
+        review_run_public_id: str,
+        submission_public_id: str,
+        source_asset: dict[str, Any],
+        visual_assets: list[VisualAsset],
+        remaining_slots: int,
+    ) -> list[dict[str, Any]]:
+        if not visual_assets or remaining_slots <= 0:
+            return []
+
+        source_name = str(source_asset.get("logical_path") or source_asset.get("real_path") or "source")
+        target_root = (
+            self.settings.artifacts_root
+            / "review_visual_assets"
+            / review_run_public_id
+            / submission_public_id
+            / (source_asset.get("public_id") or generate_public_id("asset"))
+        )
+        target_root.mkdir(parents=True, exist_ok=True)
+
+        persisted_assets: list[dict[str, Any]] = []
+        for index, visual_asset in enumerate(visual_assets[:remaining_slots], start=1):
+            suffix = Path(visual_asset.origin).suffix or self._guess_suffix_from_mime(visual_asset.mime_type)
+            stored_path = target_root / f"{index:02d}_{generate_public_id('img')}{suffix}"
+            stored_path.write_bytes(visual_asset.data)
+            persisted_assets.append(
+                {
+                    "logical_path": f"{source_name} / 内嵌图片 {index} ({Path(visual_asset.origin).name or 'image'})",
+                    "real_path": str(stored_path),
+                    "mime_type": visual_asset.mime_type,
+                    "size_bytes": len(visual_asset.data),
+                    "derived_from_asset_public_id": source_asset.get("public_id"),
+                    "derived_from_logical_path": source_name,
+                }
+            )
+        return persisted_assets
+
+    def _guess_suffix_from_mime(self, mime_type: str | None) -> str:
+        if mime_type == "image/jpeg":
+            return ".jpg"
+        if mime_type == "image/webp":
+            return ".webp"
+        if mime_type == "image/bmp":
+            return ".bmp"
+        if mime_type == "image/tiff":
+            return ".tiff"
+        return ".png"
+
     def mark_submission_for_manual_review(
         self,
         *,
@@ -258,7 +348,7 @@ class SubmissionReviewGraph:
         summary = f"评审输出异常，已转人工复核：{error_message}"
         grading_output = {
             "total_score": 0.0,
-            "score_scale": self.settings.default_review_scale,
+            "score_scale": self.runtime_settings_store.load().default_review_scale,
             "summary": summary,
             "decision": "needs_manual_review",
             "confidence": 0.0,

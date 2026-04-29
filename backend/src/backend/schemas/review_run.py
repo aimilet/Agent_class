@@ -31,6 +31,11 @@ class ReviewItemResultRead(TimestampedPublicRead):
 class ReviewResultRead(TimestampedPublicRead):
     review_run_public_id: str
     submission_public_id: str
+    enrollment_public_id: str | None = None
+    student_no: str | None = None
+    student_name: str | None = None
+    source_entry_name: str
+    current_path: str
     total_score: float | None
     score_scale: int
     summary: str | None

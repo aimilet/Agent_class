@@ -8,13 +8,13 @@ use serde::de::DeserializeOwned;
 
 use crate::models::{
     AgentRunRead, ApprovalDecisionRequest, ApprovalTaskRead, AssignmentCreate, AssignmentRead,
-    AuditEventRead, CourseCreate, CourseEnrollmentRead, CourseRead, DashboardSnapshot,
-    HealthResponse, ManualReviewUpdate, NamingPlanCreate, NamingPlanRead, NamingPolicyCreate,
-    NamingPolicyRead, ReviewQuestionItemPatch, ReviewQuestionItemRead, ReviewResultRead,
-    ReviewRunCreate, ReviewRunRead, ReviewRuntimeSettingsRead, ReviewRuntimeSettingsUpdate,
-    RosterCandidateRead, RosterImportBatchRead, RosterImportConfirmRequest,
-    SubmissionImportBatchCreate, SubmissionImportBatchRead, SubmissionImportConfirmRequest,
-    SubmissionRead, ToolCallLogRead,
+    AuditEventRead, CourseCreate, CourseEnrollmentRead, CourseRead, CourseReviewSummaryRead,
+    DashboardSnapshot, HealthResponse, ManualReviewUpdate, NamingPlanCreate, NamingPlanRead,
+    NamingPolicyCreate, NamingPolicyRead, ReviewQuestionItemPatch, ReviewQuestionItemRead,
+    ReviewResultRead, ReviewRunCreate, ReviewRunRead, ReviewRuntimeSettingsRead,
+    ReviewRuntimeSettingsUpdate, RosterCandidateRead, RosterImportBatchRead,
+    RosterImportConfirmRequest, SubmissionImportBatchCreate, SubmissionImportBatchRead,
+    SubmissionImportConfirmRequest, SubmissionRead, ToolCallLogRead,
 };
 
 #[derive(Clone)]
@@ -69,6 +69,13 @@ impl ApiClient {
         course_public_id: &str,
     ) -> Result<Vec<CourseEnrollmentRead>, String> {
         self.get_json(&format!("/courses/{course_public_id}/enrollments"))
+    }
+
+    pub fn get_course_review_summary(
+        &self,
+        course_public_id: &str,
+    ) -> Result<CourseReviewSummaryRead, String> {
+        self.get_json(&format!("/courses/{course_public_id}/review-summary"))
     }
 
     pub fn create_roster_import(

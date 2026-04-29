@@ -28,7 +28,14 @@ from backend.schemas.approvals import ApprovalItemRead, ApprovalTaskRead
 from backend.schemas.assignments import AssignmentRead
 from backend.schemas.audits import AgentRunRead, AuditEventRead, ToolCallLogRead
 from backend.schemas.common import FileRefRead
-from backend.schemas.courses import CourseEnrollmentRead, CourseRead
+from backend.schemas.courses import (
+    CourseEnrollmentRead,
+    CourseRead,
+    CourseReviewSummaryAssignmentRead,
+    CourseReviewSummaryCellRead,
+    CourseReviewSummaryRead,
+    CourseReviewSummaryRowRead,
+)
 from backend.schemas.naming import NamingOperationRead, NamingPlanRead, NamingPolicyRead
 from backend.schemas.review_prep import ReviewPrepRead, ReviewQuestionItemRead
 from backend.schemas.review_run import ReviewItemResultRead, ReviewResultRead, ReviewRunRead
@@ -293,10 +300,16 @@ def review_item_result_read(item: ReviewItemResult) -> ReviewItemResultRead:
 
 
 def review_result_read(result: ReviewResult) -> ReviewResultRead:
+    enrollment = result.submission.enrollment
     return ReviewResultRead(
         public_id=result.public_id,
         review_run_public_id=result.review_run.public_id,
         submission_public_id=result.submission.public_id,
+        enrollment_public_id=enrollment.public_id if enrollment is not None else None,
+        student_no=enrollment.display_student_no if enrollment is not None else None,
+        student_name=enrollment.display_name if enrollment is not None else None,
+        source_entry_name=result.submission.source_entry_name,
+        current_path=result.submission.current_path,
         total_score=result.total_score,
         score_scale=result.score_scale,
         summary=result.summary,
@@ -307,6 +320,39 @@ def review_result_read(result: ReviewResult) -> ReviewResultRead:
         created_at=result.created_at,
         updated_at=result.updated_at,
         items=[review_item_result_read(item) for item in result.item_results],
+    )
+
+
+def course_review_summary_read(payload: dict) -> CourseReviewSummaryRead:
+    return CourseReviewSummaryRead(
+        course_public_id=payload["course_public_id"],
+        assignments=[
+            CourseReviewSummaryAssignmentRead(
+                assignment_public_id=item["assignment_public_id"],
+                seq_no=item["seq_no"],
+                title=item["title"],
+            )
+            for item in payload["assignments"]
+        ],
+        rows=[
+            CourseReviewSummaryRowRead(
+                enrollment_public_id=row["enrollment_public_id"],
+                student_no=row.get("student_no"),
+                student_name=row["student_name"],
+                results=[
+                    CourseReviewSummaryCellRead(
+                        assignment_public_id=cell["assignment_public_id"],
+                        review_result_public_id=cell.get("review_result_public_id"),
+                        submission_public_id=cell.get("submission_public_id"),
+                        score=cell.get("score"),
+                        summary=cell.get("summary"),
+                        status=cell.get("status"),
+                    )
+                    for cell in row["results"]
+                ],
+            )
+            for row in payload["rows"]
+        ],
     )
 
 

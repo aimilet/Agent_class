@@ -56,11 +56,57 @@ cd frontend
 cargo check
 ```
 
-发布构建：
+本机 Linux 发布构建：
 
 ```bash
 cd frontend
 cargo build --release
 ```
 
-Windows/Linux 均可使用同一套 Rust 桌面前端构建；如果要完整运行 Agent 流程，仍需要同机或可访问地址上的后端与 LLM 配置。
+### Windows 客户端构建
+
+在 WSL/Linux 下给 Windows 生成可双击运行的客户端时，必须构建 MSVC 目标：
+
+```bash
+cd frontend
+bash build-windows-msvc.sh
+```
+
+生成位置：
+
+```text
+frontend/target/x86_64-pc-windows-msvc/release/frontend-gui.exe
+```
+
+如果 Windows 正在占用旧的 `frontend-gui.exe`，脚本会自动改为生成
+`frontend-gui-YYYYMMDD-HHMMSS.exe`，这仍然是同一条 MSVC 构建链路的产物。
+
+诊断版控制台程序：
+
+```bash
+cd frontend
+FRONTEND_CONSOLE=1 bash build-windows-msvc.sh
+```
+
+生成位置：
+
+```text
+frontend/target/x86_64-pc-windows-msvc/release/frontend-console.exe
+```
+
+这条链路依赖：
+
+- Rust 目标：`x86_64-pc-windows-msvc`
+- `zig`：默认路径为 `$HOME/.local/bin/zig`
+- `cargo-xwin` 已准备的 Windows MSVC sysroot：默认目录为 `/tmp/xwin-cache`
+- 项目内 shim：`frontend/toolchain/msvc-shims` 与 `tools`
+
+不要用下面这个目标给 Windows 用户发客户端：
+
+```bash
+cargo build --release --target x86_64-pc-windows-gnu
+```
+
+历史测试中 GNU 目标生成的 `frontend.exe` 在 Windows 双击运行不稳定；当前可复用的成功方式是 `x86_64-pc-windows-msvc`。
+
+Windows/Linux 均可使用同一套 Rust 桌面前端源码构建；如果要完整运行 Agent 流程，仍需要同机或可访问地址上的后端与 LLM 配置。

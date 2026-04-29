@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 from sqlalchemy import create_engine, select
@@ -9,6 +10,7 @@ from backend.db.base import Base
 from backend.core.runtime_review_settings import RuntimeReviewSettings
 from backend.domain.models import (
     Assignment,
+    ApprovalTask,
     Course,
     CourseEnrollment,
     Person,
@@ -18,6 +20,10 @@ from backend.domain.models import (
     ReviewRun,
     Submission,
 )
+from backend.services.document_parser import ParsedDocument, VisualAsset
+from backend.services.approvals import ApprovalService
+from backend.services.courses import CourseService
+from backend.services.review_run import ReviewRunService
 from backend.graphs.review_run_parent_graph import ReviewRunParentGraph
 from backend.graphs.submission_review_graph import SubmissionReviewGraph
 
@@ -228,6 +234,185 @@ def test_review_run_parent_graph_continues_after_child_failure():
     assert next_state["manual_review_results"] == 1
 
 
+def test_review_run_parent_graph_finalize_uses_fresh_result_query():
+    session = build_session()
+    review_run, submission_a, submission_b = seed_review_context(session)
+    graph = ReviewRunParentGraph(session)
+
+    # 模拟关系缓存仍为空但数据库已有结果的场景，避免完成统计写成 0。
+    _ = review_run.results
+    session.add_all(
+        [
+            ReviewResult(
+                public_id=ReviewResult.build_public_id(),
+                review_run_id=review_run.id,
+                submission_id=submission_a.id,
+                total_score=88.0,
+                score_scale=100,
+                summary="张三评分完成",
+                status="validated",
+            ),
+            ReviewResult(
+                public_id=ReviewResult.build_public_id(),
+                review_run_id=review_run.id,
+                submission_id=submission_b.id,
+                total_score=76.0,
+                score_scale=100,
+                summary="李四评分完成",
+                status="validated",
+            ),
+        ]
+    )
+    session.commit()
+
+    graph.finalize_run({"review_run_public_id": review_run.public_id, "operator_id": "tester"})
+
+    session.refresh(review_run)
+    assert review_run.status == "completed"
+    assert review_run.summary_json == {
+        "result_count": 2,
+        "validated_count": 2,
+        "manual_review_count": 0,
+    }
+
+
+def test_course_review_summary_includes_finalized_results():
+    session = build_session()
+    review_run, submission, _ = seed_review_context(session)
+    session.add(
+        ReviewResult(
+            public_id=ReviewResult.build_public_id(),
+            review_run_id=review_run.id,
+            submission_id=submission.id,
+            total_score=74.0,
+            score_scale=100,
+            summary="最终评分说明",
+            status="finalized",
+        )
+    )
+    session.commit()
+
+    payload = CourseService(session).get_review_summary(review_run.assignment.course.public_id)
+    first_row = payload["rows"][0]
+    first_cell = first_row["results"][0]
+
+    assert first_row["student_no"] == "2026001"
+    assert first_cell["score"] == 74.0
+    assert first_cell["summary"] == "最终评分说明"
+    assert first_cell["status"] == "finalized"
+
+
+def test_course_review_summary_prefers_published_result_over_finalized_result():
+    session = build_session()
+    review_run, submission, _ = seed_review_context(session)
+    second_run = ReviewRun(
+        public_id=ReviewRun.build_public_id(),
+        assignment=review_run.assignment,
+        review_prep=review_run.review_prep,
+        status="completed",
+        parallelism=1,
+    )
+    session.add(second_run)
+    session.commit()
+    session.add_all(
+        [
+            ReviewResult(
+                public_id=ReviewResult.build_public_id(),
+                review_run_id=review_run.id,
+                submission_id=submission.id,
+                total_score=90.0,
+                score_scale=100,
+                summary="未发布的新评分",
+                status="finalized",
+            ),
+            ReviewResult(
+                public_id=ReviewResult.build_public_id(),
+                review_run_id=second_run.id,
+                submission_id=submission.id,
+                total_score=80.0,
+                score_scale=100,
+                summary="已发布评分",
+                status="published",
+            ),
+        ]
+    )
+    session.commit()
+
+    payload = CourseService(session).get_review_summary(review_run.assignment.course.public_id)
+    first_cell = payload["rows"][0]["results"][0]
+
+    assert first_cell["score"] == 80.0
+    assert first_cell["summary"] == "已发布评分"
+    assert first_cell["status"] == "published"
+
+
+def test_review_run_publish_is_idempotent_for_active_task():
+    session = build_session()
+    review_run, submission, _ = seed_review_context(session)
+    session.add(
+        ReviewResult(
+            public_id=ReviewResult.build_public_id(),
+            review_run_id=review_run.id,
+            submission_id=submission.id,
+            total_score=82.0,
+            score_scale=100,
+            summary="可发布结果",
+            status="finalized",
+        )
+    )
+    session.commit()
+    service = ReviewRunService(session)
+
+    first_task = service.publish(review_run_public_id=review_run.public_id)
+    second_task = service.publish(review_run_public_id=review_run.public_id)
+    task_count = session.query(ApprovalTask).filter(ApprovalTask.object_public_id == review_run.public_id).count()
+
+    assert first_task.public_id == second_task.public_id
+    assert task_count == 1
+
+
+def test_approval_execute_publishes_results_and_cancels_duplicate_publish_tasks():
+    session = build_session()
+    review_run, submission, _ = seed_review_context(session)
+    result = ReviewResult(
+        public_id=ReviewResult.build_public_id(),
+        review_run_id=review_run.id,
+        submission_id=submission.id,
+        total_score=82.0,
+        score_scale=100,
+        summary="可发布结果",
+        status="finalized",
+    )
+    session.add(result)
+    session.commit()
+    first_task = ReviewRunService(session).publish(review_run_public_id=review_run.public_id)
+    duplicate_task = ApprovalTask(
+        public_id=ApprovalTask.build_public_id(),
+        object_type="review_run",
+        object_public_id=review_run.public_id,
+        action_type="publish",
+        status="pending",
+        title="重复发布审批",
+        summary="重复任务",
+        command_preview_json=[],
+    )
+    session.add(duplicate_task)
+    session.commit()
+
+    approval_service = ApprovalService(session)
+    approval_service.approve(approval_task_public_id=first_task.public_id, operator_note=None)
+    approval_service.execute_approved_side_effects(approval_task_public_id=first_task.public_id)
+
+    session.refresh(result)
+    session.refresh(submission)
+    session.refresh(first_task)
+    session.refresh(duplicate_task)
+    assert result.status == "published"
+    assert submission.status == "published"
+    assert first_task.status == "executed"
+    assert duplicate_task.status == "cancelled"
+
+
 def test_submission_review_graph_skips_validator_when_disabled(monkeypatch):
     session = build_session()
     review_run, submission, _ = seed_review_context(session)
@@ -277,3 +462,128 @@ def test_submission_review_graph_skips_validator_when_disabled(monkeypatch):
     assert calls == ["grading_agent"]
     assert next_state["validation_output"]["status"] == "validated"
     assert next_state["validation_output"]["validation_skipped"] is True
+
+
+def test_submission_review_graph_extracts_text_and_visual_assets_for_docx_like_files(monkeypatch, tmp_path):
+    session = build_session()
+    review_run, submission, _ = seed_review_context(session)
+    graph = SubmissionReviewGraph(session)
+    monkeypatch.setattr(graph.settings, "runtime_root", str(tmp_path / "runtime"))
+    graph.settings.ensure_runtime_dirs()
+
+    source_file = tmp_path / "sample.docx"
+    source_file.write_bytes(b"docx-bytes")
+    parse_calls: list[bool] = []
+
+    def fake_parse(path, *, include_ocr=True):
+        parse_calls.append(include_ocr)
+        return ParsedDocument(
+            parser_name="docx",
+            text="第8题与第9题的正文提取结果",
+            notes=["共识别到 2 张内嵌图片"],
+            images_detected=2,
+            visual_assets=[
+                VisualAsset(origin="word/media/image1.png", mime_type="image/png", data=b"image-1"),
+                VisualAsset(origin="word/media/image2.png", mime_type="image/png", data=b"image-2"),
+            ],
+        )
+
+    monkeypatch.setattr(graph.parser, "parse", fake_parse)
+
+    next_state = graph.parse_assets(
+        {
+            "review_run_public_id": review_run.public_id,
+            "submission_public_id": submission.public_id,
+            "operator_id": "tester",
+            "selected_assets": [
+                {
+                    "public_id": "asset_docx_1",
+                    "logical_path": "作业1_张三.docx",
+                    "real_path": str(source_file),
+                    "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                }
+            ],
+        }
+    )
+
+    assert parse_calls == [False]
+    assert "[提取正文] 作业1_张三.docx" in next_state["submission_text"]
+    assert "第8题与第9题的正文提取结果" in next_state["submission_text"]
+    assert len(next_state["extracted_visual_assets"]) == 2
+    assert all(Path(item["real_path"]).exists() for item in next_state["extracted_visual_assets"])
+    assert all(item["logical_path"].startswith("作业1_张三.docx / 内嵌图片") for item in next_state["extracted_visual_assets"])
+
+
+def test_submission_review_graph_grade_submission_passes_extracted_visual_assets(monkeypatch, tmp_path):
+    session = build_session()
+    review_run, submission, _ = seed_review_context(session)
+    graph = SubmissionReviewGraph(session)
+    extracted_image = tmp_path / "embedded.png"
+    extracted_image.write_bytes(b"image")
+    captured_payloads: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        graph.runtime_settings_store,
+        "load",
+        lambda: RuntimeReviewSettings(
+            review_prep_max_answer_rounds=3,
+            review_run_enable_validation_agent=False,
+            review_run_default_parallelism=4,
+        ),
+    )
+
+    def fake_run(*, stage_name: str, envelope, **kwargs):
+        if stage_name == "grading_agent":
+            captured_payloads.append(envelope.payload)
+            return SimpleNamespace(
+                output=SimpleNamespace(
+                    structured_output={
+                        "total_score": 85.0,
+                        "score_scale": 100,
+                        "summary": "已结合正文和图片评分",
+                        "decision": "accepted",
+                        "confidence": 0.9,
+                        "item_results": [{"question_no": 1, "score": 85.0, "reason": "基本正确"}],
+                    },
+                    confidence=0.9,
+                )
+            )
+        raise AssertionError(f"不应调用额外阶段：{stage_name}")
+
+    monkeypatch.setattr(graph.executor, "run", fake_run)
+
+    graph.grade_submission(
+        {
+            "review_run_public_id": review_run.public_id,
+            "submission_public_id": submission.public_id,
+            "operator_id": "tester",
+            "selected_assets": [
+                {
+                    "public_id": "asset_docx_1",
+                    "logical_path": "作业1_张三.docx",
+                    "real_path": str(tmp_path / "sample.docx"),
+                    "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                }
+            ],
+            "submission_text": "提取出的正文",
+            "extracted_visual_assets": [
+                {
+                    "logical_path": "作业1_张三.docx / 内嵌图片 1",
+                    "real_path": str(extracted_image),
+                    "mime_type": "image/png",
+                    "size_bytes": 5,
+                }
+            ],
+        }
+    )
+
+    assert len(captured_payloads) == 1
+    assert captured_payloads[0]["submission_text"] == "提取出的正文"
+    assert captured_payloads[0]["extracted_visual_assets"] == [
+        {
+            "logical_path": "作业1_张三.docx / 内嵌图片 1",
+            "real_path": str(extracted_image),
+            "mime_type": "image/png",
+            "size_bytes": 5,
+        }
+    ]

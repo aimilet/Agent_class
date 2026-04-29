@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from backend.core.errors import DomainError
 from backend.db.repositories import ApprovalRepository
-from backend.domain.models import NamingPlan, ReviewRun
+from backend.domain.models import ApprovalTask, NamingPlan, ReviewResult, ReviewRun
 from backend.infra.observability import AuditService
 
 
@@ -75,18 +75,23 @@ class ApprovalService:
         if task.object_type == "review_run" and task.action_type == "publish":
             review_run = self.session.scalar(
                 select(ReviewRun)
-                .options(selectinload(ReviewRun.results), selectinload(ReviewRun.assignment))
+                .options(
+                    selectinload(ReviewRun.results).selectinload(ReviewResult.submission),
+                    selectinload(ReviewRun.assignment),
+                )
                 .where(ReviewRun.public_id == task.object_public_id)
             )
             if review_run is None:
                 raise DomainError("评审运行不存在。", code="review_run_not_found", status_code=404)
             task.status = "executing"
             for result in review_run.results:
-                result.status = "published"
-                result.published_at = datetime.now(UTC)
-                result.submission.status = "published"
+                if result.status in {"validated", "finalized"}:
+                    result.status = "published"
+                    result.published_at = datetime.now(UTC)
+                    result.submission.status = "published"
             review_run.status = "completed"
             review_run.assignment.status = "published"
+            self._cancel_duplicate_publish_tasks(task)
             task.status = "executed"
         self.audit_service.record(
             event_type="approval_task_executed",
@@ -97,3 +102,16 @@ class ApprovalService:
         )
         self.session.commit()
         return task
+
+    def _cancel_duplicate_publish_tasks(self, executed_task: ApprovalTask) -> None:
+        duplicate_tasks = self.session.scalars(
+            select(ApprovalTask).where(
+                ApprovalTask.id != executed_task.id,
+                ApprovalTask.object_type == executed_task.object_type,
+                ApprovalTask.object_public_id == executed_task.object_public_id,
+                ApprovalTask.action_type == executed_task.action_type,
+                ApprovalTask.status.in_(["pending", "approved"]),
+            )
+        ).all()
+        for duplicate in duplicate_tasks:
+            duplicate.status = "cancelled"

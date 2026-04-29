@@ -13,6 +13,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
 from backend.core.errors import DomainError
+from backend.core.runtime_review_settings import RuntimeReviewSettingsStore
 from backend.core.settings import Settings, get_settings
 from backend.infra.llm.mock import MockStructuredLlm
 from backend.services.llm_utils import bytes_to_data_url
@@ -69,13 +70,14 @@ class LlmGateway:
         )
 
     def _invoke_chat_completions(self, request: StructuredLlmRequest) -> StructuredModel:
+        runtime_settings = RuntimeReviewSettingsStore(self.settings).load()
         client = ChatOpenAI(
             model=request.model_name or self.settings.llm_model,
             api_key=self.settings.llm_api_key,
             base_url=self.settings.llm_base_url,
             temperature=request.temperature,
-            timeout=self.settings.llm_timeout_seconds,
-            max_retries=self.settings.llm_max_retries,
+            timeout=runtime_settings.llm_timeout_seconds,
+            max_retries=runtime_settings.llm_max_retries,
         )
         runnable = client.with_structured_output(
             request.output_model,
@@ -131,9 +133,10 @@ class LlmGateway:
             "Authorization": f"Bearer {self.settings.llm_api_key}",
             "Content-Type": "application/json",
         }
-        retry_count = max(0, self.settings.llm_max_retries)
+        runtime_settings = RuntimeReviewSettingsStore(self.settings).load()
+        retry_count = max(0, runtime_settings.llm_max_retries)
         last_error: DomainError | None = None
-        with httpx.Client(timeout=self.settings.llm_timeout_seconds) as client:
+        with httpx.Client(timeout=runtime_settings.llm_timeout_seconds) as client:
             for attempt in range(retry_count + 1):
                 try:
                     response = client.post(url, headers=headers, json=payload)

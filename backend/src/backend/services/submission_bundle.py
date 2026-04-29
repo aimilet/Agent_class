@@ -7,6 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
+from backend.core.runtime_review_settings import RuntimeReviewSettingsStore
 from backend.config import Settings, get_settings
 from backend.services.document_parser import DocumentParser, VisualAsset
 
@@ -64,6 +65,7 @@ class SubmissionBundleParser:
     def __init__(self, parser: DocumentParser | None = None, settings: Settings | None = None) -> None:
         self.parser = parser or DocumentParser()
         self.settings = settings or get_settings()
+        self.runtime_settings = RuntimeReviewSettingsStore(self.settings).load()
 
     def parse_submission(self, submission_path: str | Path) -> SubmissionBundle:
         resolved = Path(submission_path).expanduser().resolve()
@@ -92,8 +94,8 @@ class SubmissionBundleParser:
         depth: int,
         counter: dict[str, int],
     ) -> SubmissionBundle:
-        if depth > self.settings.submission_unpack_max_depth:
-            raise ValueError(f"超过最大递归层数 {self.settings.submission_unpack_max_depth}，已停止展开。")
+        if depth > self.runtime_settings.submission_unpack_max_depth:
+            raise ValueError(f"超过最大递归层数 {self.runtime_settings.submission_unpack_max_depth}，已停止展开。")
 
         if path.is_dir():
             return self._parse_directory(path, logical_path=logical_path, scratch_root=scratch_root, depth=depth, counter=counter)
@@ -114,8 +116,8 @@ class SubmissionBundleParser:
             raise ValueError(f"暂不支持的文件格式：{suffix or path.name}")
 
         counter["leaf_files"] += 1
-        if counter["leaf_files"] > self.settings.submission_unpack_max_files:
-            raise ValueError(f"提交内文件过多，超过上限 {self.settings.submission_unpack_max_files}。")
+        if counter["leaf_files"] > self.runtime_settings.submission_unpack_max_files:
+            raise ValueError(f"提交内文件过多，超过上限 {self.runtime_settings.submission_unpack_max_files}。")
 
         parsed = self.parser.parse(path)
         return SubmissionBundle(
@@ -332,8 +334,8 @@ class SubmissionBundleParser:
                     target.mkdir(parents=True, exist_ok=True)
                     continue
                 extracted += 1
-                if extracted > self.settings.submission_unpack_max_files:
-                    raise ValueError(f"压缩包文件数超过上限 {self.settings.submission_unpack_max_files}。")
+                if extracted > self.runtime_settings.submission_unpack_max_files:
+                    raise ValueError(f"压缩包文件数超过上限 {self.runtime_settings.submission_unpack_max_files}。")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with handle.open(member) as source, target.open("wb") as sink:
                     sink.write(source.read())
@@ -352,8 +354,8 @@ class SubmissionBundleParser:
                 if not member.isfile():
                     continue
                 extracted += 1
-                if extracted > self.settings.submission_unpack_max_files:
-                    raise ValueError(f"压缩包文件数超过上限 {self.settings.submission_unpack_max_files}。")
+                if extracted > self.runtime_settings.submission_unpack_max_files:
+                    raise ValueError(f"压缩包文件数超过上限 {self.runtime_settings.submission_unpack_max_files}。")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 source = handle.extractfile(member)
                 if source is None:

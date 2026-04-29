@@ -13,6 +13,7 @@ from backend.agents.base import AgentExecutor
 from backend.core.background_jobs import get_background_job_registry
 from backend.core.ids import generate_public_id
 from backend.core.pathing import resolve_user_path
+from backend.core.runtime_review_settings import RuntimeReviewSettingsStore
 from backend.core.settings import get_settings
 from backend.db.repositories import AssignmentRepository, CourseRepository, EnrollmentRepository, SubmissionRepository
 from backend.domain.models import Assignment
@@ -66,6 +67,7 @@ class SubmissionImportGraph:
         self.agent = SubmissionMatchAgent()
         self.agent_executor = AgentExecutor(session)
         self.settings = get_settings()
+        self.runtime_settings = RuntimeReviewSettingsStore(self.settings).load()
         self.job_registry = get_background_job_registry()
         self.compiled = compile_graph(
             state_schema=SubmissionImportState,
@@ -148,7 +150,7 @@ class SubmissionImportGraph:
         self._raise_if_cancel_requested(batch_public_id)
         if self._should_skip_path(path):
             return []
-        if depth > self.settings.submission_unpack_max_depth:
+        if depth > self.runtime_settings.submission_unpack_max_depth:
             return []
         if path.is_dir():
             assets: list[dict[str, Any]] = []
@@ -169,7 +171,7 @@ class SubmissionImportGraph:
         if not path.is_file():
             return []
         if self._is_archive(path):
-            if depth >= self.settings.submission_unpack_max_depth:
+            if depth >= self.runtime_settings.submission_unpack_max_depth:
                 return [self._single_asset(path, logical_path=logical_path, asset_role="archive_unexpanded")]
             try:
                 extract_root = self._extract_archive_for_manifest(path, unpack_root, batch_public_id=batch_public_id)
@@ -191,7 +193,7 @@ class SubmissionImportGraph:
                 )
             return assets
         counter["files"] += 1
-        if counter["files"] > self.settings.submission_unpack_max_files:
+        if counter["files"] > self.runtime_settings.submission_unpack_max_files:
             return []
         return [self._single_asset(path, logical_path=logical_path)]
 
@@ -251,8 +253,8 @@ class SubmissionImportGraph:
                     target.mkdir(parents=True, exist_ok=True)
                     continue
                 extracted += 1
-                if extracted > self.settings.submission_unpack_max_files:
-                    raise ValueError(f"压缩包文件数超过上限 {self.settings.submission_unpack_max_files}。")
+                if extracted > self.runtime_settings.submission_unpack_max_files:
+                    raise ValueError(f"压缩包文件数超过上限 {self.runtime_settings.submission_unpack_max_files}。")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with handle.open(member) as source, target.open("wb") as sink:
                     sink.write(source.read())
@@ -271,8 +273,8 @@ class SubmissionImportGraph:
                 if not member.isfile():
                     continue
                 extracted += 1
-                if extracted > self.settings.submission_unpack_max_files:
-                    raise ValueError(f"压缩包文件数超过上限 {self.settings.submission_unpack_max_files}。")
+                if extracted > self.runtime_settings.submission_unpack_max_files:
+                    raise ValueError(f"压缩包文件数超过上限 {self.runtime_settings.submission_unpack_max_files}。")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 source = handle.extractfile(member)
                 if source is None:

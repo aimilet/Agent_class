@@ -16,13 +16,13 @@ use rfd::FileDialog;
 use crate::api::ApiClient;
 use crate::models::{
     AgentRunRead, ApprovalTaskRead, AssignmentCreate, AssignmentRead, AuditEventRead, CourseCreate,
-    CourseEnrollmentRead, CourseRead, DashboardSnapshot, HealthResponse, ManualReviewUpdate,
-    NamingPlanCreate, NamingPlanRead, NamingPolicyCreate, NamingPolicyRead, ReviewPrepRead,
-    ReviewQuestionItemPatch, ReviewQuestionItemRead, ReviewResultRead, ReviewRunCreate,
-    ReviewRunRead, ReviewRuntimeSettingsRead, ReviewRuntimeSettingsUpdate,
-    RosterCandidateDecision, RosterCandidateRead, RosterImportBatchRead, RosterImportConfirmRequest,
-    SubmissionConfirmDecision, SubmissionImportBatchCreate, SubmissionImportBatchRead,
-    SubmissionImportConfirmRequest, SubmissionRead, ToolCallLogRead,
+    CourseEnrollmentRead, CourseRead, CourseReviewSummaryRead, DashboardSnapshot, HealthResponse,
+    ManualReviewUpdate, NamingPlanCreate, NamingPlanRead, NamingPolicyCreate, NamingPolicyRead,
+    ReviewPrepRead, ReviewQuestionItemPatch, ReviewQuestionItemRead, ReviewResultRead,
+    ReviewRunCreate, ReviewRunRead, ReviewRuntimeSettingsRead, ReviewRuntimeSettingsUpdate,
+    RosterCandidateDecision, RosterCandidateRead, RosterImportBatchRead,
+    RosterImportConfirmRequest, SubmissionConfirmDecision, SubmissionImportBatchCreate,
+    SubmissionImportBatchRead, SubmissionImportConfirmRequest, SubmissionRead, ToolCallLogRead,
 };
 
 const MAX_BACKEND_LOG_LINES: usize = 600;
@@ -38,6 +38,7 @@ const ROSTER_PARSE_MODES: [(&str, &str); 3] = [
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WorkspacePage {
     Overview,
+    Summary,
     Courses,
     Assignments,
     Naming,
@@ -48,8 +49,9 @@ enum WorkspacePage {
 }
 
 impl WorkspacePage {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::Overview,
+        Self::Summary,
         Self::Courses,
         Self::Assignments,
         Self::Naming,
@@ -62,6 +64,7 @@ impl WorkspacePage {
     fn title(self) -> &'static str {
         match self {
             Self::Overview => "总览",
+            Self::Summary => "成绩汇总",
             Self::Courses => "课程与名单",
             Self::Assignments => "作业与提交",
             Self::Naming => "命名与审批",
@@ -75,6 +78,7 @@ impl WorkspacePage {
     fn subtitle(self) -> &'static str {
         match self {
             Self::Overview => "以课程为中心查看当前流程进度。",
+            Self::Summary => "按课程查看已发布作业成绩与简评汇总。",
             Self::Courses => "创建课程，导入名单，并确认学生候选。",
             Self::Assignments => "创建单次作业，导入作业目录，并确认匹配关系。",
             Self::Naming => "生成命名计划，查看命令预览，审批后再执行。",
@@ -88,13 +92,14 @@ impl WorkspacePage {
     fn nav_index(self) -> &'static str {
         match self {
             Self::Overview => "01",
-            Self::Courses => "02",
-            Self::Assignments => "03",
-            Self::Naming => "04",
-            Self::ReviewPrep => "05",
-            Self::ReviewRun => "06",
-            Self::Audit => "07",
-            Self::Settings => "08",
+            Self::Summary => "02",
+            Self::Courses => "03",
+            Self::Assignments => "04",
+            Self::Naming => "05",
+            Self::ReviewPrep => "06",
+            Self::ReviewRun => "07",
+            Self::Audit => "08",
+            Self::Settings => "09",
         }
     }
 }
@@ -104,6 +109,7 @@ pub struct AssistantApp {
     health: Option<HealthResponse>,
     courses: Vec<CourseRead>,
     enrollments: Vec<CourseEnrollmentRead>,
+    course_review_summary: Option<CourseReviewSummaryRead>,
     assignments: Vec<AssignmentRead>,
     submissions: Vec<SubmissionRead>,
     roster_batch: Option<RosterImportBatchRead>,
@@ -128,6 +134,7 @@ pub struct AssistantApp {
     active_page: WorkspacePage,
     status: String,
     pending_tasks: usize,
+    course_context_requested_for: Option<String>,
     last_runtime_poll_at: Instant,
     runtime_poll_in_flight: bool,
     event_tx: Sender<WorkerEvent>,
@@ -204,6 +211,12 @@ struct ReviewSettingsForm {
     review_prep_max_answer_rounds: String,
     review_run_default_parallelism: String,
     review_run_enable_validation_agent: bool,
+    default_review_scale: String,
+    submission_unpack_max_depth: String,
+    submission_unpack_max_files: String,
+    vision_max_assets_per_submission: String,
+    llm_timeout_seconds: String,
+    llm_max_retries: String,
 }
 
 enum WorkerEvent {
@@ -225,6 +238,7 @@ enum WorkerEvent {
     ReviewRunLoaded(ReviewRunRead),
     ReviewResultsLoaded(Vec<ReviewResultRead>),
     ReviewSettingsLoaded(ReviewRuntimeSettingsRead),
+    CourseReviewSummaryLoaded(CourseReviewSummaryRead),
     AgentRunsLoaded(Vec<AgentRunRead>),
     ToolCallsLoaded(Vec<ToolCallLogRead>),
     AuditEventsLoaded(Vec<AuditEventRead>),
@@ -293,6 +307,12 @@ impl Default for ReviewSettingsForm {
             review_prep_max_answer_rounds: "3".to_owned(),
             review_run_default_parallelism: "4".to_owned(),
             review_run_enable_validation_agent: true,
+            default_review_scale: "100".to_owned(),
+            submission_unpack_max_depth: "4".to_owned(),
+            submission_unpack_max_files: "120".to_owned(),
+            vision_max_assets_per_submission: "6".to_owned(),
+            llm_timeout_seconds: "120".to_owned(),
+            llm_max_retries: "2".to_owned(),
         }
     }
 }
@@ -301,7 +321,7 @@ impl AssistantApp {
     pub fn new(cc: &CreationContext<'_>) -> Self {
         install_cjk_font(&cc.egui_ctx);
         apply_macos_theme(&cc.egui_ctx);
-        cc.egui_ctx.set_pixels_per_point(1.05);
+        cc.egui_ctx.set_pixels_per_point(1.12);
 
         let (event_tx, event_rx) = channel();
         let app = Self {
@@ -309,6 +329,7 @@ impl AssistantApp {
             health: None,
             courses: Vec::new(),
             enrollments: Vec::new(),
+            course_review_summary: None,
             assignments: Vec::new(),
             submissions: Vec::new(),
             roster_batch: None,
@@ -333,6 +354,7 @@ impl AssistantApp {
             active_page: WorkspacePage::Overview,
             status: "桌面端已启动，等待连接后端".to_owned(),
             pending_tasks: 0,
+            course_context_requested_for: None,
             last_runtime_poll_at: Instant::now() - RUNTIME_POLL_INTERVAL,
             runtime_poll_in_flight: false,
             event_tx,
@@ -449,13 +471,17 @@ impl AssistantApp {
                     ));
                 }
                 if let Some(prep_id) = review_prep_id {
-                    events.push(WorkerEvent::ReviewPrepLoaded(client.get_review_prep(&prep_id)?));
+                    events.push(WorkerEvent::ReviewPrepLoaded(
+                        client.get_review_prep(&prep_id)?,
+                    ));
                     events.push(WorkerEvent::ReviewQuestionsLoaded(
                         client.list_review_questions(&prep_id).unwrap_or_default(),
                     ));
                 }
                 if let Some(run_id) = review_run_id {
-                    events.push(WorkerEvent::ReviewRunLoaded(client.get_review_run(&run_id)?));
+                    events.push(WorkerEvent::ReviewRunLoaded(
+                        client.get_review_run(&run_id)?,
+                    ));
                     events.push(WorkerEvent::ReviewResultsLoaded(
                         client.list_review_results(&run_id).unwrap_or_default(),
                     ));
@@ -516,11 +542,24 @@ impl AssistantApp {
         self.spawn_task("加载课程上下文", move |api| {
             Ok(vec![
                 WorkerEvent::EnrollmentsLoaded(api.list_enrollments(&course_id)?),
+                WorkerEvent::CourseReviewSummaryLoaded(api.get_course_review_summary(&course_id)?),
                 WorkerEvent::AssignmentsLoaded(api.list_assignments(&course_id)?),
                 WorkerEvent::AuditEventsLoaded(
                     api.list_course_audit_events(&course_id).unwrap_or_default(),
                 ),
             ])
+        });
+    }
+
+    fn spawn_load_course_review_summary(&self) {
+        let Some(course_id) = self.selected_course_id.clone() else {
+            self.send_error("请先选择课程。");
+            return;
+        };
+        self.spawn_task("加载成绩汇总", move |api| {
+            Ok(vec![WorkerEvent::CourseReviewSummaryLoaded(
+                api.get_course_review_summary(&course_id)?,
+            )])
         });
     }
 
@@ -1028,27 +1067,82 @@ impl AssistantApp {
     }
 
     fn spawn_save_review_settings(&self) {
-        let review_prep_max_answer_rounds = match self
-            .review_settings_form
-            .review_prep_max_answer_rounds
-            .trim()
-            .parse::<i64>()
-        {
+        let review_prep_max_answer_rounds = match parse_i64_setting(
+            &self.review_settings_form.review_prep_max_answer_rounds,
+            "评审初始化最大轮数",
+        ) {
             Ok(value) => value,
-            Err(_) => {
-                self.send_error("评审初始化最大轮数必须是整数。");
+            Err(message) => {
+                self.send_error(&message);
                 return;
             }
         };
-        let review_run_default_parallelism = match self
-            .review_settings_form
-            .review_run_default_parallelism
-            .trim()
-            .parse::<i64>()
-        {
+        let review_run_default_parallelism = match parse_i64_setting(
+            &self.review_settings_form.review_run_default_parallelism,
+            "默认并行数",
+        ) {
             Ok(value) => value,
-            Err(_) => {
-                self.send_error("默认并行数必须是整数。");
+            Err(message) => {
+                self.send_error(&message);
+                return;
+            }
+        };
+        let default_review_scale =
+            match parse_i64_setting(&self.review_settings_form.default_review_scale, "默认总分")
+            {
+                Ok(value) => value,
+                Err(message) => {
+                    self.send_error(&message);
+                    return;
+                }
+            };
+        let submission_unpack_max_depth = match parse_i64_setting(
+            &self.review_settings_form.submission_unpack_max_depth,
+            "压缩包递归深度",
+        ) {
+            Ok(value) => value,
+            Err(message) => {
+                self.send_error(&message);
+                return;
+            }
+        };
+        let submission_unpack_max_files = match parse_i64_setting(
+            &self.review_settings_form.submission_unpack_max_files,
+            "压缩包最大文件数",
+        ) {
+            Ok(value) => value,
+            Err(message) => {
+                self.send_error(&message);
+                return;
+            }
+        };
+        let vision_max_assets_per_submission = match parse_i64_setting(
+            &self.review_settings_form.vision_max_assets_per_submission,
+            "每份作业图片上限",
+        ) {
+            Ok(value) => value,
+            Err(message) => {
+                self.send_error(&message);
+                return;
+            }
+        };
+        let llm_timeout_seconds = match parse_f64_setting(
+            &self.review_settings_form.llm_timeout_seconds,
+            "模型请求超时",
+        ) {
+            Ok(value) => value,
+            Err(message) => {
+                self.send_error(&message);
+                return;
+            }
+        };
+        let llm_max_retries = match parse_i64_setting(
+            &self.review_settings_form.llm_max_retries,
+            "模型请求重试次数",
+        ) {
+            Ok(value) => value,
+            Err(message) => {
+                self.send_error(&message);
                 return;
             }
         };
@@ -1058,6 +1152,12 @@ impl AssistantApp {
                 .review_settings_form
                 .review_run_enable_validation_agent,
             review_run_default_parallelism,
+            default_review_scale,
+            submission_unpack_max_depth,
+            submission_unpack_max_files,
+            vision_max_assets_per_submission,
+            llm_timeout_seconds,
+            llm_max_retries,
         };
         self.spawn_task("保存评审设置", move |api| {
             let settings = api.update_review_settings(&payload)?;
@@ -1139,10 +1239,30 @@ impl AssistantApp {
             self.send_error("当前没有审批任务。");
             return;
         };
+        let course_id = self.selected_course_id.clone();
+        let review_run_id = self
+            .active_approval
+            .as_ref()
+            .filter(|task| task.object_type == "review_run")
+            .map(|task| task.object_public_id.clone());
         self.spawn_task("执行审批副作用", move |api| {
-            Ok(vec![WorkerEvent::ApprovalLoaded(
-                api.execute_approval_task(&task_id)?,
-            )])
+            let approval = api.execute_approval_task(&task_id)?;
+            let mut events = vec![WorkerEvent::ApprovalLoaded(approval)];
+            if let Some(run_id) = review_run_id {
+                events.push(WorkerEvent::ReviewRunLoaded(api.get_review_run(&run_id)?));
+                events.push(WorkerEvent::ReviewResultsLoaded(
+                    api.list_review_results(&run_id)?,
+                ));
+            }
+            if let Some(course_id) = course_id {
+                events.push(WorkerEvent::CourseReviewSummaryLoaded(
+                    api.get_course_review_summary(&course_id)?,
+                ));
+                events.push(WorkerEvent::AssignmentsLoaded(
+                    api.list_assignments(&course_id)?,
+                ));
+            }
+            Ok(events)
         });
     }
 
@@ -1343,9 +1463,13 @@ impl AssistantApp {
                 }
                 WorkerEvent::SnapshotLoaded(snapshot) => self.apply_snapshot(snapshot),
                 WorkerEvent::CourseCreated(course) => {
-                    self.selected_course_id = Some(course.public_id)
+                    self.selected_course_id = Some(course.public_id);
+                    self.course_context_requested_for = None;
                 }
                 WorkerEvent::EnrollmentsLoaded(items) => self.enrollments = items,
+                WorkerEvent::CourseReviewSummaryLoaded(summary) => {
+                    self.course_review_summary = Some(summary)
+                }
                 WorkerEvent::AssignmentsLoaded(items) => self.apply_assignments(items),
                 WorkerEvent::RosterBatchLoaded(batch) => {
                     if is_roster_runtime_active(&batch.status) {
@@ -1398,7 +1522,11 @@ impl AssistantApp {
         if self.selected_course_id.is_none() || self.selected_course().is_none() {
             self.selected_course_id = self.courses.first().map(|course| course.public_id.clone());
         }
-        if self.selected_course_id.is_some() && self.assignments.is_empty() {
+        if let Some(course_id) = self.selected_course_id.clone()
+            && self.course_context_requested_for.as_ref() != Some(&course_id)
+            && !self.has_active_runtime_job()
+        {
+            self.course_context_requested_for = Some(course_id);
             self.spawn_load_course_context();
         }
     }
@@ -1410,6 +1538,16 @@ impl AssistantApp {
             settings.review_run_default_parallelism.to_string();
         self.review_settings_form.review_run_enable_validation_agent =
             settings.review_run_enable_validation_agent;
+        self.review_settings_form.default_review_scale = settings.default_review_scale.to_string();
+        self.review_settings_form.submission_unpack_max_depth =
+            settings.submission_unpack_max_depth.to_string();
+        self.review_settings_form.submission_unpack_max_files =
+            settings.submission_unpack_max_files.to_string();
+        self.review_settings_form.vision_max_assets_per_submission =
+            settings.vision_max_assets_per_submission.to_string();
+        self.review_settings_form.llm_timeout_seconds =
+            format_compact_f64(settings.llm_timeout_seconds);
+        self.review_settings_form.llm_max_retries = settings.llm_max_retries.to_string();
     }
 
     fn apply_assignments(&mut self, assignments: Vec<AssignmentRead>) {
@@ -1640,6 +1778,7 @@ impl AssistantApp {
 
     fn navigation_panel(&mut self, ui: &mut Ui) {
         egui::ScrollArea::vertical()
+            .id_salt("sidebar-scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.vertical(|ui| {
@@ -1690,12 +1829,14 @@ impl AssistantApp {
 
     fn workspace_panel(&mut self, ui: &mut Ui) {
         egui::ScrollArea::vertical()
+            .id_salt(format!("workspace-scroll-{}", self.active_page.nav_index()))
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 self.render_page_header(ui);
                 ui.add_space(12.0);
                 match self.active_page {
                     WorkspacePage::Overview => self.render_overview_page(ui),
+                    WorkspacePage::Summary => self.render_summary_page(ui),
                     WorkspacePage::Courses => self.render_courses_page(ui),
                     WorkspacePage::Assignments => self.render_assignments_page(ui),
                     WorkspacePage::Naming => self.render_naming_page(ui),
@@ -1713,45 +1854,47 @@ impl AssistantApp {
             self.active_page.title(),
             self.active_page.subtitle(),
             |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    metric_card(
-                        ui,
-                        "服务",
-                        self.health
-                            .as_ref()
-                            .map(|item| item.app_name.as_str())
-                            .unwrap_or("未连接"),
-                        self.health
-                            .as_ref()
-                            .map(|item| {
-                                if item.llm_enabled {
-                                    "LLM 已启用"
-                                } else {
-                                    "LLM 未启用"
-                                }
-                            })
-                            .unwrap_or("等待连接"),
-                    );
-                    metric_card(ui, "课程", &self.courses.len().to_string(), "独立课程空间");
-                    metric_card(
-                        ui,
-                        "学生",
-                        &self.enrollments.len().to_string(),
-                        "当前课程名单",
-                    );
-                    metric_card(
-                        ui,
-                        "作业",
-                        &self.assignments.len().to_string(),
-                        "当前课程作业",
-                    );
-                    metric_card(
-                        ui,
-                        "Agent",
-                        &self.agent_runs.len().to_string(),
-                        "可追溯调用",
-                    );
-                });
+                if self.active_page == WorkspacePage::Overview {
+                    ui.horizontal_wrapped(|ui| {
+                        metric_card(
+                            ui,
+                            "服务",
+                            self.health
+                                .as_ref()
+                                .map(|item| item.app_name.as_str())
+                                .unwrap_or("未连接"),
+                            self.health
+                                .as_ref()
+                                .map(|item| {
+                                    if item.llm_enabled {
+                                        "LLM 已启用"
+                                    } else {
+                                        "LLM 未启用"
+                                    }
+                                })
+                                .unwrap_or("等待连接"),
+                        );
+                        metric_card(ui, "课程", &self.courses.len().to_string(), "独立课程空间");
+                        metric_card(
+                            ui,
+                            "学生",
+                            &self.enrollments.len().to_string(),
+                            "当前课程名单",
+                        );
+                        metric_card(
+                            ui,
+                            "作业",
+                            &self.assignments.len().to_string(),
+                            "当前课程作业",
+                        );
+                        metric_card(
+                            ui,
+                            "Agent",
+                            &self.agent_runs.len().to_string(),
+                            "可追溯调用",
+                        );
+                    });
+                }
             },
         );
     }
@@ -1838,6 +1981,40 @@ impl AssistantApp {
         );
     }
 
+    fn render_summary_page(&mut self, ui: &mut Ui) {
+        section_card(
+            ui,
+            "课程成绩汇总",
+            "汇总已完成评分的结果；已发布结果优先，未发布的最终评分也会先显示。",
+            |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    self.render_course_selector(ui);
+                    if ui.button("刷新汇总").clicked() {
+                        self.spawn_load_course_review_summary();
+                    }
+                });
+                ui.add_space(8.0);
+                if let Some(summary) = &self.course_review_summary {
+                    if summary.assignments.is_empty() {
+                        empty_state(
+                            ui,
+                            "还没有作业",
+                            "完成正式评审后，这里会显示课程汇总表。",
+                        );
+                        return;
+                    }
+                    course_review_summary_table(ui, summary);
+                } else {
+                    empty_state(
+                        ui,
+                        "还没有汇总数据",
+                        "先选择课程并加载上下文或点击刷新汇总。",
+                    );
+                }
+            },
+        );
+    }
+
     fn render_courses_page(&mut self, ui: &mut Ui) {
         two_columns(ui, |left, right| {
             let ui = left;
@@ -1877,7 +2054,8 @@ impl AssistantApp {
                         self.spawn_load_course_context();
                     }
                     egui::ScrollArea::vertical()
-                        .max_height(260.0)
+                        .max_height(360.0)
+                        .id_salt("courses-list-scroll")
                         .show(ui, |ui| {
                             for course in self.courses.clone() {
                                 let selected =
@@ -1894,6 +2072,7 @@ impl AssistantApp {
                                 .clicked()
                                 {
                                     self.selected_course_id = Some(course.public_id);
+                                    self.course_context_requested_for = None;
                                     self.spawn_load_course_context();
                                 }
                             }
@@ -1925,7 +2104,7 @@ impl AssistantApp {
                             self.roster_form.file_paths.clear();
                         }
                     });
-                    path_list(ui, &self.roster_form.file_paths);
+                    path_list(ui, "roster-files", &self.roster_form.file_paths);
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("1. 创建批次").clicked() {
                             self.spawn_create_roster_import();
@@ -1984,7 +2163,8 @@ impl AssistantApp {
                         self.enrollments.len()
                     ));
                     egui::ScrollArea::vertical()
-                        .max_height(320.0)
+                        .id_salt("roster-list-scroll")
+                        .max_height(420.0)
                         .show(ui, |ui| {
                             if !self.roster_candidates.is_empty() {
                                 candidate_table(ui, &self.roster_candidates);
@@ -2031,7 +2211,8 @@ impl AssistantApp {
                         self.spawn_load_assignment_context();
                     }
                     egui::ScrollArea::vertical()
-                        .max_height(260.0)
+                        .id_salt("assignments-list-scroll")
+                        .max_height(360.0)
                         .show(ui, |ui| {
                             for assignment in self.assignments.clone() {
                                 let selected = Some(&assignment.public_id)
@@ -2064,6 +2245,7 @@ impl AssistantApp {
                     ui.horizontal(|ui| {
                         ui.add(
                             TextEdit::singleline(&mut self.submission_form.root_path)
+                                .id_salt("submission-root-path")
                                 .desired_width(360.0)
                                 .hint_text("作业文件夹路径"),
                         );
@@ -2076,7 +2258,10 @@ impl AssistantApp {
                             self.spawn_create_submission_import();
                         }
                         if ui
-                            .add_enabled(!submission_running, egui::Button::new("2. 运行导入 Agent"))
+                            .add_enabled(
+                                !submission_running,
+                                egui::Button::new("2. 运行导入 Agent"),
+                            )
                             .clicked()
                         {
                             self.spawn_run_submission_import();
@@ -2209,13 +2394,20 @@ impl AssistantApp {
                             self.review_prep_form.material_paths.clear();
                         }
                     });
-                    path_list(ui, &self.review_prep_form.material_paths);
+                    path_list(
+                        ui,
+                        "review-materials",
+                        &self.review_prep_form.material_paths,
+                    );
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("1. 创建初始化版本").clicked() {
                             self.spawn_create_review_prep();
                         }
                         if ui
-                            .add_enabled(!review_prep_running, egui::Button::new("2. 运行初始化 Agent"))
+                            .add_enabled(
+                                !review_prep_running,
+                                egui::Button::new("2. 运行初始化 Agent"),
+                            )
                             .clicked()
                         {
                             self.spawn_run_review_prep();
@@ -2258,7 +2450,8 @@ impl AssistantApp {
                 "单题单题检查题目、答案和评分规范。",
                 |ui| {
                     egui::ScrollArea::vertical()
-                        .max_height(320.0)
+                        .id_salt("review-questions-scroll")
+                        .max_height(440.0)
                         .show(ui, |ui| {
                             for item in self.review_questions.clone() {
                                 let selected =
@@ -2351,12 +2544,18 @@ impl AssistantApp {
                         detail_line(
                             ui,
                             "默认并行",
-                            &health.review_runtime_settings.review_run_default_parallelism.to_string(),
+                            &health
+                                .review_runtime_settings
+                                .review_run_default_parallelism
+                                .to_string(),
                         );
                         detail_line(
                             ui,
                             "校验 Agent",
-                            if health.review_runtime_settings.review_run_enable_validation_agent {
+                            if health
+                                .review_runtime_settings
+                                .review_run_enable_validation_agent
+                            {
                                 "开启"
                             } else {
                                 "关闭"
@@ -2368,7 +2567,10 @@ impl AssistantApp {
                             self.spawn_create_review_run();
                         }
                         if ui
-                            .add_enabled(!review_run_running, egui::Button::new("2. 启动评审 Agent"))
+                            .add_enabled(
+                                !review_run_running,
+                                egui::Button::new("2. 启动评审 Agent"),
+                            )
                             .clicked()
                         {
                             self.spawn_start_review_run();
@@ -2414,31 +2616,11 @@ impl AssistantApp {
             section_card(
                 ui,
                 "评审结果",
-                "选择一条结果可查看评分理由并人工复核。",
+                "每条结果都直接显示学生、文件、分数和状态。",
                 |ui| {
-                    egui::ScrollArea::vertical()
-                        .max_height(360.0)
-                        .show(ui, |ui| {
-                            for result in self.review_results.clone() {
-                                let score = result
-                                    .total_score
-                                    .map(|value| format!("{value:.1}/{}", result.score_scale))
-                                    .unwrap_or_else(|| "未评分".to_owned());
-                                let selected =
-                                    Some(&result.public_id) == self.selected_result_id.as_ref();
-                                if selectable_card(
-                                    ui,
-                                    selected,
-                                    &score,
-                                    &format!("{} · {}", result.status, result.submission_public_id),
-                                )
-                                .clicked()
-                                {
-                                    self.selected_result_id = Some(result.public_id);
-                                    self.sync_result_form();
-                                }
-                            }
-                        });
+                    if review_result_table(ui, &self.review_results, &mut self.selected_result_id) {
+                        self.sync_result_form();
+                    }
                 },
             );
             let ui = right;
@@ -2449,7 +2631,18 @@ impl AssistantApp {
                 |ui| {
                     if let Some(result) = self.selected_result() {
                         detail_line(ui, "结果", &result.public_id);
+                        detail_line(
+                            ui,
+                            "学生",
+                            &format!(
+                                "{} {}",
+                                result.student_no.as_deref().unwrap_or("-"),
+                                result.student_name.as_deref().unwrap_or("未匹配学生")
+                            ),
+                        );
                         detail_line(ui, "提交", &result.submission_public_id);
+                        detail_line(ui, "文件", &result.source_entry_name);
+                        detail_line(ui, "路径", &result.current_path);
                         detail_line(ui, "状态", &result.status);
                         ui.label(
                             RichText::new("Agent 说明")
@@ -2504,6 +2697,7 @@ impl AssistantApp {
                         self.spawn_load_audit();
                     }
                     egui::ScrollArea::vertical()
+                        .id_salt("agent-runs-scroll")
                         .max_height(420.0)
                         .show(ui, |ui| {
                             for run in self.agent_runs.clone() {
@@ -2552,6 +2746,7 @@ impl AssistantApp {
                         }
                         ui.separator();
                         egui::ScrollArea::vertical()
+                            .id_salt("tool-calls-scroll")
                             .max_height(420.0)
                             .show(ui, |ui| {
                                 for call in &self.tool_calls {
@@ -2584,8 +2779,8 @@ impl AssistantApp {
             let ui = left;
             section_card(
                 ui,
-                "连接设置",
-                "业务功能与运行设置分离，避免所有选项堆在一个界面。",
+                "连接与状态",
+                "桌面端连接目标、运行目录和模型可用性。",
                 |ui| {
                     labeled_text(
                         ui,
@@ -2615,47 +2810,98 @@ impl AssistantApp {
                             },
                         );
                     }
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("刷新运行设置").clicked() {
+                            self.spawn_load_review_settings();
+                        }
+                        if ui.button("保存全部设置").clicked() {
+                            self.spawn_save_review_settings();
+                        }
+                    });
                 },
             );
             ui.add_space(12.0);
             section_card(
                 ui,
-                "评审节奏",
-                "通过后端 API 持久化到运行目录，下一次执行立即生效，不依赖 .env 重载。",
+                "1. 名单与作业导入",
+                "控制压缩包递归展开与单次导入可处理的文件量。",
                 |ui| {
                     labeled_text(
                         ui,
-                        "初始化最大轮数",
-                        &mut self.review_settings_form.review_prep_max_answer_rounds,
-                        "建议 1-3",
+                        "压缩包递归深度",
+                        &mut self.review_settings_form.submission_unpack_max_depth,
+                        "1-10",
                     );
+                    labeled_text(
+                        ui,
+                        "压缩包最大文件数",
+                        &mut self.review_settings_form.submission_unpack_max_files,
+                        "1-2000",
+                    );
+                },
+            );
+            ui.add_space(12.0);
+            section_card(
+                ui,
+                "4. 评审初始化",
+                "控制题目解析后答案生成与纠正的最多轮数。",
+                |ui| {
+                    labeled_text(
+                        ui,
+                        "答案生成最大轮数",
+                        &mut self.review_settings_form.review_prep_max_answer_rounds,
+                        "1-8",
+                    );
+                },
+            );
+            ui.add_space(12.0);
+            section_card(
+                ui,
+                "5. 正式评审",
+                "控制并行评分、校验轮次、分值量程和文档内嵌图片数量。",
+                |ui| {
                     labeled_text(
                         ui,
                         "默认并行数",
                         &mut self.review_settings_form.review_run_default_parallelism,
-                        "建议 2-6",
+                        "1-32",
+                    );
+                    labeled_text(
+                        ui,
+                        "默认总分",
+                        &mut self.review_settings_form.default_review_scale,
+                        "通常为 100",
+                    );
+                    labeled_text(
+                        ui,
+                        "每份作业图片上限",
+                        &mut self.review_settings_form.vision_max_assets_per_submission,
+                        "1-32",
                     );
                     ui.checkbox(
                         &mut self.review_settings_form.review_run_enable_validation_agent,
                         "正式评审启用二次校验 Agent",
                     );
-                    detail_line(
+                },
+            );
+            let ui = right;
+            section_card(
+                ui,
+                "模型请求",
+                "控制每次 LLM 请求等待时间和失败重试次数。",
+                |ui| {
+                    labeled_text(
                         ui,
-                        "效果",
-                        if self.review_settings_form.review_run_enable_validation_agent {
-                            "开启后每份作业通常会多一次校验请求。"
-                        } else {
-                            "关闭后正式评审默认只发起一次评分请求。"
-                        },
+                        "请求超时秒数",
+                        &mut self.review_settings_form.llm_timeout_seconds,
+                        "10-900",
                     );
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("刷新评审设置").clicked() {
-                            self.spawn_load_review_settings();
-                        }
-                        if ui.button("保存评审设置").clicked() {
-                            self.spawn_save_review_settings();
-                        }
-                    });
+                    labeled_text(
+                        ui,
+                        "请求重试次数",
+                        &mut self.review_settings_form.llm_max_retries,
+                        "0-8",
+                    );
                 },
             );
             ui.add_space(12.0);
@@ -2684,36 +2930,102 @@ impl AssistantApp {
                     detail_line(ui, "状态", &self.backend_control.state);
                 },
             );
-            let ui = right;
+            ui.add_space(12.0);
             section_card(
                 ui,
-                "后端日志",
-                "只显示桌面端托管进程的 stdout/stderr。",
+                "当前生效",
+                "后端返回的运行设置快照。",
                 |ui| {
                     if let Some(health) = &self.health {
                         detail_line(
                             ui,
-                            "当前初始化轮数",
-                            &health.review_runtime_settings.review_prep_max_answer_rounds.to_string(),
+                            "答案轮数",
+                            &health
+                                .review_runtime_settings
+                                .review_prep_max_answer_rounds
+                                .to_string(),
                         );
                         detail_line(
                             ui,
-                            "当前默认并行",
-                            &health.review_runtime_settings.review_run_default_parallelism.to_string(),
+                            "默认并行",
+                            &health
+                                .review_runtime_settings
+                                .review_run_default_parallelism
+                                .to_string(),
                         );
                         detail_line(
                             ui,
-                            "当前正式评审校验",
-                            if health.review_runtime_settings.review_run_enable_validation_agent {
+                            "默认总分",
+                            &health
+                                .review_runtime_settings
+                                .default_review_scale
+                                .to_string(),
+                        );
+                        detail_line(
+                            ui,
+                            "解压深度",
+                            &health
+                                .review_runtime_settings
+                                .submission_unpack_max_depth
+                                .to_string(),
+                        );
+                        detail_line(
+                            ui,
+                            "文件上限",
+                            &health
+                                .review_runtime_settings
+                                .submission_unpack_max_files
+                                .to_string(),
+                        );
+                        detail_line(
+                            ui,
+                            "图片上限",
+                            &health
+                                .review_runtime_settings
+                                .vision_max_assets_per_submission
+                                .to_string(),
+                        );
+                        detail_line(
+                            ui,
+                            "请求超时",
+                            &format!(
+                                "{} 秒",
+                                format_compact_f64(
+                                    health.review_runtime_settings.llm_timeout_seconds
+                                )
+                            ),
+                        );
+                        detail_line(
+                            ui,
+                            "请求重试",
+                            &health.review_runtime_settings.llm_max_retries.to_string(),
+                        );
+                        detail_line(
+                            ui,
+                            "校验 Agent",
+                            if health
+                                .review_runtime_settings
+                                .review_run_enable_validation_agent
+                            {
                                 "开启"
                             } else {
                                 "关闭"
                             },
                         );
-                        ui.add_space(10.0);
+                    } else {
+                        empty_state(ui, "未连接后端", "检测连接后会显示当前运行设置。");
                     }
+                },
+            );
+            ui.add_space(12.0);
+            section_card(
+                ui,
+                "后端日志",
+                "只显示桌面端托管进程的 stdout/stderr。",
+                |ui| {
                     egui::ScrollArea::vertical()
-                        .max_height(560.0)
+                        .id_salt("backend-logs-scroll")
+                        .max_height(360.0)
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
                             for line in &self.backend_control.logs {
@@ -2726,8 +3038,10 @@ impl AssistantApp {
     }
 
     fn render_course_selector(&mut self, ui: &mut Ui) {
+        let previous_course_id = self.selected_course_id.clone();
         ui.label(RichText::new("课程").small().color(subtle_text_color()));
         egui::ComboBox::from_id_salt("course-selector")
+            .width(ui.available_width().max(320.0))
             .selected_text(
                 self.selected_course()
                     .map(|course| course.course_name.clone())
@@ -2742,11 +3056,15 @@ impl AssistantApp {
                     );
                 }
             });
+        if previous_course_id != self.selected_course_id {
+            self.course_context_requested_for = None;
+        }
     }
 
     fn render_assignment_selector(&mut self, ui: &mut Ui) {
         ui.label(RichText::new("作业").small().color(subtle_text_color()));
         egui::ComboBox::from_id_salt("assignment-selector")
+            .width(ui.available_width().max(320.0))
             .selected_text(
                 self.selected_assignment()
                     .map(|item| format!("第 {} 次 · {}", item.seq_no, item.title))
@@ -2800,13 +3118,19 @@ impl AssistantApp {
                     );
                     ui.horizontal_wrapped(|ui| {
                         if ui
-                            .add_enabled(!action_locked && approval_pending, egui::Button::new("批准"))
+                            .add_enabled(
+                                !action_locked && approval_pending,
+                                egui::Button::new("批准"),
+                            )
                             .clicked()
                         {
                             self.spawn_approve_active_task();
                         }
                         if ui
-                            .add_enabled(!action_locked && approval_pending, egui::Button::new("拒绝"))
+                            .add_enabled(
+                                !action_locked && approval_pending,
+                                egui::Button::new("拒绝"),
+                            )
                             .clicked()
                         {
                             self.spawn_reject_active_task();
@@ -2823,6 +3147,7 @@ impl AssistantApp {
                         }
                     });
                     egui::ScrollArea::vertical()
+                        .id_salt("approval-command-preview-scroll")
                         .max_height(220.0)
                         .show(ui, |ui| {
                             for command in &task.command_preview {
@@ -2889,11 +3214,11 @@ impl Drop for AssistantApp {
 
 fn apply_macos_theme(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = egui::vec2(10.0, 10.0);
-    style.spacing.button_padding = egui::vec2(14.0, 8.0);
-    style.spacing.interact_size = egui::vec2(36.0, 34.0);
-    style.spacing.text_edit_width = 260.0;
-    style.spacing.combo_width = 240.0;
+    style.spacing.item_spacing = egui::vec2(12.0, 12.0);
+    style.spacing.button_padding = egui::vec2(16.0, 10.0);
+    style.spacing.interact_size = egui::vec2(42.0, 40.0);
+    style.spacing.text_edit_width = 340.0;
+    style.spacing.combo_width = 340.0;
     style.visuals = egui::Visuals::light();
     style.visuals.override_text_color = Some(text_primary_color());
     style.visuals.panel_fill = canvas_color();
@@ -2923,19 +3248,19 @@ fn apply_macos_theme(ctx: &egui::Context) {
     style.visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
     style.text_styles.insert(
         egui::TextStyle::Heading,
-        FontId::new(24.0, FontFamily::Proportional),
+        FontId::new(28.0, FontFamily::Proportional),
     );
     style.text_styles.insert(
         egui::TextStyle::Body,
-        FontId::new(14.5, FontFamily::Proportional),
+        FontId::new(16.5, FontFamily::Proportional),
     );
     style.text_styles.insert(
         egui::TextStyle::Button,
-        FontId::new(14.0, FontFamily::Proportional),
+        FontId::new(15.5, FontFamily::Proportional),
     );
     style.text_styles.insert(
         egui::TextStyle::Small,
-        FontId::new(12.0, FontFamily::Proportional),
+        FontId::new(14.0, FontFamily::Proportional),
     );
     ctx.set_style(style);
 }
@@ -3000,8 +3325,13 @@ fn inner_panel_frame() -> egui::Frame {
 }
 
 fn two_columns(ui: &mut Ui, contents: impl FnOnce(&mut Ui, &mut Ui)) {
+    let available_width = ui.available_width();
     ui.columns(2, |columns| {
         let (left_slice, right_slice) = columns.split_at_mut(1);
+        if available_width >= 1380.0 {
+            left_slice[0].set_width(available_width * 0.52);
+            right_slice[0].set_width(available_width * 0.46);
+        }
         contents(&mut left_slice[0], &mut right_slice[0]);
     });
 }
@@ -3054,9 +3384,18 @@ fn selectable_card(ui: &mut Ui, selected: bool, title: &str, subtitle: &str) -> 
         .shadow(chip_shadow())
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(title).strong().color(text_primary_color()));
+            ui.label(
+                RichText::new(title)
+                    .size(16.5)
+                    .strong()
+                    .color(text_primary_color()),
+            );
             if !subtitle.is_empty() {
-                ui.label(RichText::new(subtitle).small().color(subtle_text_color()));
+                ui.label(
+                    RichText::new(subtitle)
+                        .size(14.2)
+                        .color(subtle_text_color()),
+                );
             }
         })
         .response;
@@ -3177,6 +3516,7 @@ fn labeled_text(ui: &mut Ui, label: &str, value: &mut String, hint: &str) {
     ui.label(RichText::new(label).small().color(subtle_text_color()));
     ui.add(
         TextEdit::singleline(value)
+            .id_salt(label)
             .desired_width(f32::INFINITY)
             .hint_text(hint),
     );
@@ -3186,6 +3526,7 @@ fn labeled_multiline(ui: &mut Ui, label: &str, value: &mut String, hint: &str) {
     ui.label(RichText::new(label).small().color(subtle_text_color()));
     ui.add(
         TextEdit::multiline(value)
+            .id_salt(label)
             .desired_width(f32::INFINITY)
             .desired_rows(4)
             .hint_text(hint),
@@ -3206,13 +3547,14 @@ fn execution_state_line(ui: &mut Ui, status: &str) {
     });
 }
 
-fn path_list(ui: &mut Ui, paths: &[String]) {
+fn path_list(ui: &mut Ui, id: &'static str, paths: &[String]) {
     if paths.is_empty() {
         ui.label(RichText::new("未选择文件。 ").color(subtle_text_color()));
         return;
     }
     egui::ScrollArea::vertical()
-        .max_height(120.0)
+        .id_salt(id)
+        .max_height(180.0)
         .show(ui, |ui| {
             for path in paths {
                 ui.monospace(path);
@@ -3259,35 +3601,122 @@ fn enrollment_table(ui: &mut Ui, items: &[CourseEnrollmentRead]) {
 }
 
 fn submission_table(ui: &mut Ui, items: &[SubmissionRead]) {
-    egui::ScrollArea::both().max_height(420.0).show(ui, |ui| {
-        egui::Grid::new("submissions-grid")
-            .striped(true)
-            .min_col_width(110.0)
-            .show(ui, |ui| {
-                ui.strong("文件");
-                ui.strong("状态");
-                ui.strong("匹配");
-                ui.strong("置信度");
-                ui.strong("当前路径");
-                ui.end_row();
-                for item in items {
-                    ui.label(&item.source_entry_name);
-                    ui.colored_label(status_color(&item.status), &item.status);
-                    ui.label(item.enrollment_public_id.as_deref().unwrap_or("未匹配"));
-                    ui.label(
-                        item.match_confidence
-                            .map(|value| format!("{value:.2}"))
-                            .unwrap_or_else(|| "-".to_owned()),
-                    );
-                    ui.monospace(shorten(&item.current_path, 72));
+    egui::ScrollArea::both()
+        .id_salt("submissions-table-scroll")
+        .max_height(420.0)
+        .show(ui, |ui| {
+            egui::Grid::new("submissions-grid")
+                .striped(true)
+                .min_col_width(110.0)
+                .show(ui, |ui| {
+                    ui.strong("文件");
+                    ui.strong("状态");
+                    ui.strong("匹配");
+                    ui.strong("置信度");
+                    ui.strong("当前路径");
                     ui.end_row();
-                }
-            });
-    });
+                    for item in items {
+                        ui.label(&item.source_entry_name);
+                        ui.colored_label(status_color(&item.status), &item.status);
+                        ui.label(item.enrollment_public_id.as_deref().unwrap_or("未匹配"));
+                        ui.label(
+                            item.match_confidence
+                                .map(|value| format!("{value:.2}"))
+                                .unwrap_or_else(|| "-".to_owned()),
+                        );
+                        ui.monospace(shorten(&item.current_path, 72));
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
+fn review_result_table(
+    ui: &mut Ui,
+    items: &[ReviewResultRead],
+    selected_result_id: &mut Option<String>,
+) -> bool {
+    let mut changed = false;
+    egui::ScrollArea::both()
+        .id_salt("review-results-table-scroll")
+        .max_height(520.0)
+        .show(ui, |ui| {
+            egui::Grid::new("review-results-grid")
+                .striped(true)
+                .min_col_width(110.0)
+                .show(ui, |ui| {
+                    ui.strong("学号");
+                    ui.strong("姓名");
+                    ui.strong("文件");
+                    ui.strong("分数");
+                    ui.strong("状态");
+                    ui.end_row();
+                    for item in items {
+                        let selected = Some(&item.public_id) == selected_result_id.as_ref();
+                        if ui
+                            .selectable_label(selected, item.student_no.as_deref().unwrap_or("-"))
+                            .clicked()
+                        {
+                            *selected_result_id = Some(item.public_id.clone());
+                            changed = true;
+                        }
+                        ui.label(item.student_name.as_deref().unwrap_or("未匹配学生"));
+                        ui.label(shorten(&item.source_entry_name, 28));
+                        ui.label(
+                            item.total_score
+                                .map(|value| format!("{value:.1}/{}", item.score_scale))
+                                .unwrap_or_else(|| "未评分".to_owned()),
+                        );
+                        ui.colored_label(status_color(&item.status), &item.status);
+                        ui.end_row();
+                    }
+                });
+        });
+    changed
+}
+
+fn course_review_summary_table(ui: &mut Ui, summary: &CourseReviewSummaryRead) {
+    egui::ScrollArea::both()
+        .id_salt("course-review-summary-table-scroll")
+        .max_height(700.0)
+        .show(ui, |ui| {
+            egui::Grid::new("course-review-summary-grid")
+                .striped(true)
+                .min_col_width(120.0)
+                .show(ui, |ui| {
+                    ui.strong("学号");
+                    ui.strong("姓名");
+                    for assignment in &summary.assignments {
+                        ui.strong(format!("作业{}分数", assignment.seq_no));
+                        ui.strong(format!("作业{}简评", assignment.seq_no));
+                    }
+                    ui.end_row();
+
+                    for row in &summary.rows {
+                        ui.label(row.student_no.as_deref().unwrap_or("-"));
+                        ui.label(&row.student_name);
+                        for cell in &row.results {
+                            ui.label(
+                                cell.score
+                                    .map(|value| format!("{value:.1}"))
+                                    .unwrap_or_else(|| "-".to_owned()),
+                            );
+                            ui.label(
+                                cell.summary
+                                    .as_deref()
+                                    .map(|value| shorten(value, 26))
+                                    .unwrap_or_else(|| "-".to_owned()),
+                            );
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
 }
 
 fn naming_operation_table(ui: &mut Ui, items: &[crate::models::NamingOperationRead]) {
     egui::ScrollArea::both()
+        .id_salt("naming-operations-table-scroll")
         .max_height(460.0)
         .show(ui, |ui| {
             egui::Grid::new("naming-operations-grid")
@@ -3312,6 +3741,7 @@ fn naming_operation_table(ui: &mut Ui, items: &[crate::models::NamingOperationRe
 
 fn audit_table(ui: &mut Ui, items: &[AuditEventRead]) {
     egui::ScrollArea::vertical()
+        .id_salt("audit-events-scroll")
         .max_height(420.0)
         .show(ui, |ui| {
             for item in items {
@@ -3341,6 +3771,7 @@ fn json_block(ui: &mut Ui, value: &serde_json::Value) {
     let mut text = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
     ui.add(
         TextEdit::multiline(&mut text)
+            .id_salt(format!("json-block-{:p}", value))
             .font(egui::TextStyle::Monospace)
             .desired_rows(4)
             .desired_width(f32::INFINITY)
@@ -3390,9 +3821,7 @@ fn runtime_state_text(status: &str) -> &'static str {
     match status {
         "failed" => "执行失败",
         "cancelled" => "已停止",
-        "needs_review" | "parsed" | "confirmed" | "completed" | "ready" | "applied" => {
-            "已完成"
-        }
+        "needs_review" | "parsed" | "confirmed" | "completed" | "ready" | "applied" => "已完成",
         _ => "待执行",
     }
 }
@@ -3400,16 +3829,35 @@ fn runtime_state_text(status: &str) -> &'static str {
 fn status_color(status: &str) -> Color32 {
     match status {
         "active" | "applied" | "ready" | "completed" | "confirmed" | "approved" | "executed"
-        | "published" | "renamed" | "finalized" | "parsed" => success_color(),
-        "draft" | "pending" | "queued" | "running" | "generated" | "pending_approval"
-        | "executing" | "naming_ready" | "reviewing" | "parsing" | "scanning" | "matching"
-        | "material_parsing" | "question_structuring" | "answer_generating"
-        | "answer_critiquing" | "rubric_generating" | "selecting_assets" | "grading"
-        | "validating" | "needs_review" => warning_color(),
-        "failed" | "error" | "rejected" | "conflicted" | "needs_manual_review"
-        | "partial_failed" | "unmatched" => {
-            danger_color()
-        }
+        | "published" | "renamed" | "finalized" | "validated" | "parsed" => success_color(),
+        "draft"
+        | "pending"
+        | "queued"
+        | "running"
+        | "generated"
+        | "pending_approval"
+        | "executing"
+        | "naming_ready"
+        | "reviewing"
+        | "parsing"
+        | "scanning"
+        | "matching"
+        | "material_parsing"
+        | "question_structuring"
+        | "answer_generating"
+        | "answer_critiquing"
+        | "rubric_generating"
+        | "selecting_assets"
+        | "grading"
+        | "validating"
+        | "needs_review" => warning_color(),
+        "failed"
+        | "error"
+        | "rejected"
+        | "conflicted"
+        | "needs_manual_review"
+        | "partial_failed"
+        | "unmatched" => danger_color(),
         "cancelled" => muted_chip_color(),
         _ => muted_chip_color(),
     }
@@ -3507,6 +3955,28 @@ fn trimmed_option(value: &str) -> Option<String> {
         None
     } else {
         Some(trimmed.to_owned())
+    }
+}
+
+fn parse_i64_setting(value: &str, label: &str) -> Result<i64, String> {
+    value
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| format!("{label}必须是整数。"))
+}
+
+fn parse_f64_setting(value: &str, label: &str) -> Result<f64, String> {
+    value
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| format!("{label}必须是数字。"))
+}
+
+fn format_compact_f64(value: f64) -> String {
+    if value.fract().abs() < f64::EPSILON {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.1}")
     }
 }
 

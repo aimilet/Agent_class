@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from backend.core.background_jobs import BackgroundJobCancelled, get_background_job_registry
-from backend.domain.models import ReviewRun, Submission
+from backend.domain.models import ReviewResult, ReviewRun, Submission
 from backend.graphs.common import compile_graph
 from backend.graphs.submission_review_graph import SubmissionReviewGraph
 from backend.infra.observability import AuditService
@@ -135,11 +135,16 @@ class ReviewRunParentGraph:
     def finalize_run(self, state: ReviewRunParentState) -> ReviewRunParentState:
         self._raise_if_cancel_requested(state["review_run_public_id"])
         review_run = self.session.scalar(select(ReviewRun).where(ReviewRun.public_id == state["review_run_public_id"]))
-        validated = [result for result in review_run.results if result.status == "validated"]
-        manual = [result for result in review_run.results if result.status == "needs_manual_review"]
+        results = list(
+            self.session.scalars(
+                select(ReviewResult).where(ReviewResult.review_run_id == review_run.id)
+            ).all()
+        )
+        validated = [result for result in results if result.status == "validated"]
+        manual = [result for result in results if result.status == "needs_manual_review"]
         review_run.status = "completed" if not manual else "needs_review"
         review_run.summary_json = {
-            "result_count": len(review_run.results),
+            "result_count": len(results),
             "validated_count": len(validated),
             "manual_review_count": len(manual),
         }

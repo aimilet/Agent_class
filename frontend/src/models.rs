@@ -7,6 +7,12 @@ pub struct ReviewRuntimeSettingsRead {
     pub review_prep_max_answer_rounds: i64,
     pub review_run_enable_validation_agent: bool,
     pub review_run_default_parallelism: i64,
+    pub default_review_scale: i64,
+    pub submission_unpack_max_depth: i64,
+    pub submission_unpack_max_files: i64,
+    pub vision_max_assets_per_submission: i64,
+    pub llm_timeout_seconds: f64,
+    pub llm_max_retries: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -14,6 +20,12 @@ pub struct ReviewRuntimeSettingsUpdate {
     pub review_prep_max_answer_rounds: i64,
     pub review_run_enable_validation_agent: bool,
     pub review_run_default_parallelism: i64,
+    pub default_review_scale: i64,
+    pub submission_unpack_max_depth: i64,
+    pub submission_unpack_max_files: i64,
+    pub vision_max_assets_per_submission: i64,
+    pub llm_timeout_seconds: f64,
+    pub llm_max_retries: i64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -67,6 +79,38 @@ pub struct CourseEnrollmentRead {
     pub display_student_no: Option<String>,
     pub display_name: String,
     pub status: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CourseReviewSummaryAssignmentRead {
+    pub assignment_public_id: String,
+    pub seq_no: i64,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CourseReviewSummaryCellRead {
+    pub assignment_public_id: String,
+    pub review_result_public_id: Option<String>,
+    pub submission_public_id: Option<String>,
+    pub score: Option<f32>,
+    pub summary: Option<String>,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CourseReviewSummaryRowRead {
+    pub enrollment_public_id: String,
+    pub student_no: Option<String>,
+    pub student_name: String,
+    pub results: Vec<CourseReviewSummaryCellRead>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CourseReviewSummaryRead {
+    pub course_public_id: String,
+    pub assignments: Vec<CourseReviewSummaryAssignmentRead>,
+    pub rows: Vec<CourseReviewSummaryRowRead>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -343,6 +387,11 @@ pub struct ReviewResultRead {
     pub updated_at: String,
     pub review_run_public_id: String,
     pub submission_public_id: String,
+    pub enrollment_public_id: Option<String>,
+    pub student_no: Option<String>,
+    pub student_name: Option<String>,
+    pub source_entry_name: String,
+    pub current_path: String,
     pub total_score: Option<f32>,
     pub score_scale: i64,
     pub summary: Option<String>,

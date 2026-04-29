@@ -4,9 +4,9 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from backend.api.dependencies import get_db
-from backend.schemas.courses import CourseCreate, CourseEnrollmentRead, CourseRead
+from backend.schemas.courses import CourseCreate, CourseEnrollmentRead, CourseRead, CourseReviewSummaryRead
 from backend.services.courses import CourseService
-from backend.services.serializers import course_read, enrollment_read
+from backend.services.serializers import course_read, course_review_summary_read, enrollment_read
 
 
 router = APIRouter(tags=["courses"])
@@ -35,3 +35,9 @@ def get_course(course_public_id: str, session: Session = Depends(get_db)) -> Cou
 def list_enrollments(course_public_id: str, session: Session = Depends(get_db)) -> list[CourseEnrollmentRead]:
     service = CourseService(session)
     return [enrollment_read(item) for item in service.list_enrollments(course_public_id)]
+
+
+@router.get("/courses/{course_public_id}/review-summary", response_model=CourseReviewSummaryRead)
+def get_review_summary(course_public_id: str, session: Session = Depends(get_db)) -> CourseReviewSummaryRead:
+    service = CourseService(session)
+    return course_review_summary_read(service.get_review_summary(course_public_id))
